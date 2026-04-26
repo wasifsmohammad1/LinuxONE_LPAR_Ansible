@@ -1,11 +1,11 @@
 # ============================================================
-# LinuxONE multi-LPAR provisioning report
+# LinuxONE multi-LPAR provisioning report (parallel run)
 # CPC : P00BF028
 # HMC : 10.200.81.139
-# Generated : 2026-04-26T17:24:44Z
-# Total partitions processed : 1
-# Successes : 1
-# Failures  : 0
+# Generated : 2026-04-26T21:01:57Z
+# Total partitions : 4
+# Successes        : 4
+# Failures         : 0
 # ============================================================
 
 [l1testw1]
@@ -19,16 +19,83 @@ boot_volume    = vol-boot-l1testw1-KVM
 data_volumes   = vol-libvirt01-01, vol-vgextra01-02
 nics           = mgmt-bond1-port1, mgmt-bond1-port2, data-bond2-port1, data-bond2-port2
 pchids         = 10c, 1ec, 10c, 1ec
-wwpn_1         = c05076c40e000463
-wwpn_2         = c05076c40e000462
-wwpn_3         = c05076c40e000466
-wwpn_4         = c05076c40e000465
+duration_s     = 128
+wwpn_1         = c05076c40e00049b
+wwpn_2         = c05076c40e00049f
+wwpn_3         = c05076c40e00049e
+wwpn_4         = c05076c40e00049d
+
+[l1testw2]
+status         = OK
+description    = l1testw2
+ifls           = 1
+memory_mb      = 4096
+storage_group  = l1testw2-OS
+connectivity   = 4
+boot_volume    = vol-boot-l1testw2-KVM
+data_volumes   = vol-libvirt01-01, vol-vgextra01-02
+nics           = mgmt-bond1-port1, mgmt-bond1-port2, data-bond2-port1, data-bond2-port2
+pchids         = 10c, 1ec, 10c, 1ec
+duration_s     = 124
+wwpn_1         = c05076c40e0004a2
+wwpn_2         = c05076c40e0004a3
+wwpn_3         = c05076c40e0004a5
+wwpn_4         = c05076c40e0004a6
+
+[l1testw3]
+status         = OK
+description    = l1testw3
+ifls           = 1
+memory_mb      = 4096
+storage_group  = l1testw3-OS
+connectivity   = 4
+boot_volume    = vol-boot-l1testw3-KVM
+data_volumes   = vol-libvirt01-01, vol-vgextra01-02
+nics           = mgmt-bond1-port1, mgmt-bond1-port2, data-bond2-port1, data-bond2-port2
+pchids         = 10c, 1ec, 10c, 1ec
+duration_s     = 93
+wwpn_1         = c05076c40e000496
+wwpn_2         = c05076c40e000499
+wwpn_3         = c05076c40e000497
+wwpn_4         = c05076c40e00049a
+
+[l1testw4]
+status         = OK
+description    = l1testw4
+ifls           = 1
+memory_mb      = 4096
+storage_group  = l1testw4-OS
+connectivity   = 4
+boot_volume    = vol-boot-l1testw4-KVM
+data_volumes   = vol-libvirt01-01, vol-vgextra01-02
+nics           = mgmt-bond1-port1, mgmt-bond1-port2, data-bond2-port1, data-bond2-port2
+pchids         = 10c, 1ec, 10c, 1ec
+duration_s     = 129
+wwpn_1         = c05076c40e0004a9
+wwpn_2         = c05076c40e0004a7
+wwpn_3         = c05076c40e0004ab
+wwpn_4         = c05076c40e0004aa
 
 # ============================================================
 # SAN ZONING — give this whole list to your storage admin:
 # ============================================================
 # l1testw1 (l1testw1-OS):
-    c05076c40e000463
-    c05076c40e000462
-    c05076c40e000466
-    c05076c40e000465
+    c05076c40e00049b
+    c05076c40e00049f
+    c05076c40e00049e
+    c05076c40e00049d
+# l1testw2 (l1testw2-OS):
+    c05076c40e0004a2
+    c05076c40e0004a3
+    c05076c40e0004a5
+    c05076c40e0004a6
+# l1testw3 (l1testw3-OS):
+    c05076c40e000496
+    c05076c40e000499
+    c05076c40e000497
+    c05076c40e00049a
+# l1testw4 (l1testw4-OS):
+    c05076c40e0004a9
+    c05076c40e0004a7
+    c05076c40e0004ab
+    c05076c40e0004aa

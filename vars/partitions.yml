@@ -33,23 +33,17 @@ partitions:
     maximum_memory: 32768
     autostart: false
 
-    # device_number is the 4-hex-char subchannel address inside the partition.
-    # Must be unique PER PARTITION (each partition has its own subchannel
-    # space, so the same number can repeat across partitions).
-    #   mgmt-bond1-port1 -> 0600   data-bond2-port1 -> 0100
-    #   mgmt-bond1-port2 -> 0700   data-bond2-port2 -> 0200
-    # Inside Linux these will surface as /sys/bus/ccw/devices/0.0.0600 etc.
     network_adapters:
-      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0600", description: "mgmt-bond1-port1" }
-      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0700", description: "mgmt-bond1-port2" }
-      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0100", description: "data-bond2-port1" }
-      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0200", description: "data-bond2-port2" }
+      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", description: "mgmt-bond1-port1" }
+      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", description: "mgmt-bond1-port2" }
+      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", description: "data-bond2-port1" }
+      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", description: "data-bond2-port2" }
 
     storage:
       group_name:        "l1testw1-OS"
       group_description: "FCP SG for l1testw1-OS"
       connectivity:      4                  # 2 WWPNs (multipath)
-      max_partitions:    1
+      max-partitions: 1
       boot_volume:
         name:        "vol-boot-l1testw1-KVM"
         description: "Boot disk"
@@ -59,45 +53,38 @@ partitions:
         - { name: "vol-vgextra01-02", size: 120, description: "kvm-vgextra" }
 
   # ---------------------------------------------------------------------------
-  # 2) l1testw2 — clone of l1testw1 with its own SG + volume names so the
-  #    parallel run actually has more than one host to fan out to.
+  # 2) Production application partition — second tenant
   # ---------------------------------------------------------------------------
   - name: l1testw2
     description: "l1testw2"
     type: linux
     processor_mode: shared
     ifl_processors: 1
-    initial_memory: 4096
+    initial_memory: 4096 
     maximum_memory: 32768
     autostart: false
 
-    # device_number is the 4-hex-char subchannel address inside the partition.
-    # Must be unique PER PARTITION (each partition has its own subchannel
-    # space, so the same number can repeat across partitions).
-    #   mgmt-bond1-port1 -> 0600   data-bond2-port1 -> 0100
-    #   mgmt-bond1-port2 -> 0700   data-bond2-port2 -> 0200
-    # Inside Linux these will surface as /sys/bus/ccw/devices/0.0.0600 etc.
     network_adapters:
-      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0600", description: "mgmt-bond1-port1" }
-      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0700", description: "mgmt-bond1-port2" }
-      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0100", description: "data-bond2-port1" }
-      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0200", description: "data-bond2-port2" }
-
+      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", description: "mgmt-bond1-port1" }
+      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", description: "mgmt-bond1-port2" }
+      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", description: "data-bond2-port1" }
+      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", description: "data-bond2-port2" }
+      
     storage:
       group_name:        "l1testw2-OS"
       group_description: "FCP SG for l1testw2-OS"
-      connectivity:      4
-      max_partitions:    1
+      connectivity:      4                  # 2 WWPNs (multipath)
+      max-partitions: 1
       boot_volume:
         name:        "vol-boot-l1testw2-KVM"
         description: "Boot disk"
-        size:        300
+        size:        300                     # GB
       data_volumes:
-        - { name: "vol-libvirt02-01", size: 120, description: "kvm-libvirt" }
-        - { name: "vol-vgextra02-02", size: 120, description: "kvm-vgextra" }
+        - { name: "vol-libvirt01-01", size: 120, description: "kvm-libvirt" }
+        - { name: "vol-vgextra01-02", size: 120, description: "kvm-vgextra" }
 
   # ---------------------------------------------------------------------------
-  # 3) l1testw3
+  # 3) Database partition — bigger memory, 4 FCP paths for throughput
   # ---------------------------------------------------------------------------
   - name: l1testw3
     description: "l1testw3"
@@ -108,33 +95,27 @@ partitions:
     maximum_memory: 32768
     autostart: false
 
-    # device_number is the 4-hex-char subchannel address inside the partition.
-    # Must be unique PER PARTITION (each partition has its own subchannel
-    # space, so the same number can repeat across partitions).
-    #   mgmt-bond1-port1 -> 0600   data-bond2-port1 -> 0100
-    #   mgmt-bond1-port2 -> 0700   data-bond2-port2 -> 0200
-    # Inside Linux these will surface as /sys/bus/ccw/devices/0.0.0600 etc.
     network_adapters:
-      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0600", description: "mgmt-bond1-port1" }
-      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0700", description: "mgmt-bond1-port2" }
-      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0100", description: "data-bond2-port1" }
-      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0200", description: "data-bond2-port2" }
+      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", description: "mgmt-bond1-port1" }
+      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", description: "mgmt-bond1-port2" }
+      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", description: "data-bond2-port1" }
+      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", description: "data-bond2-port2" }
 
     storage:
       group_name:        "l1testw3-OS"
       group_description: "FCP SG for l1testw3-OS"
-      connectivity:      4
-      max_partitions:    1
+      connectivity:      4                  # 2 WWPNs (multipath)
+      max-partitions: 1
       boot_volume:
         name:        "vol-boot-l1testw3-KVM"
         description: "Boot disk"
-        size:        300
+        size:        300                     # GB
       data_volumes:
-        - { name: "vol-libvirt03-01", size: 120, description: "kvm-libvirt" }
-        - { name: "vol-vgextra03-02", size: 120, description: "kvm-vgextra" }
+        - { name: "vol-libvirt01-01", size: 120, description: "kvm-libvirt" }
+        - { name: "vol-vgextra01-02", size: 120, description: "kvm-vgextra" }
 
   # ---------------------------------------------------------------------------
-  # 4) l1testw4
+  # 4) Dev/test partition — small footprint, one FCP path
   # ---------------------------------------------------------------------------
   - name: l1testw4
     description: "l1testw4"
@@ -145,27 +126,22 @@ partitions:
     maximum_memory: 32768
     autostart: false
 
-    # device_number is the 4-hex-char subchannel address inside the partition.
-    # Must be unique PER PARTITION (each partition has its own subchannel
-    # space, so the same number can repeat across partitions).
-    #   mgmt-bond1-port1 -> 0600   data-bond2-port1 -> 0100
-    #   mgmt-bond1-port2 -> 0700   data-bond2-port2 -> 0200
-    # Inside Linux these will surface as /sys/bus/ccw/devices/0.0.0600 etc.
     network_adapters:
-      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0600", description: "mgmt-bond1-port1" }
-      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0700", description: "mgmt-bond1-port2" }
-      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0100", description: "data-bond2-port1" }
-      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0200", description: "data-bond2-port2" }
+      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", description: "mgmt-bond1-port1" }
+      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", description: "mgmt-bond1-port2" }
+      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", description: "data-bond2-port1" }
+      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", description: "data-bond2-port2" }
 
     storage:
       group_name:        "l1testw4-OS"
       group_description: "FCP SG for l1testw4-OS"
-      connectivity:      4
-      max_partitions:    1
+      connectivity:      4                  # 2 WWPNs (multipath)
+      max_partitions: 1
       boot_volume:
         name:        "vol-boot-l1testw4-KVM"
         description: "Boot disk"
-        size:        300
+        size:        300                     # GB
       data_volumes:
-        - { name: "vol-libvirt04-01", size: 120, description: "kvm-libvirt" }
-        - { name: "vol-vgextra04-02", size: 120, description: "kvm-vgextra" }
+        - { name: "vol-libvirt01-01", size: 120, description: "kvm-libvirt" }
+        - { name: "vol-vgextra01-02", size: 120, description: "kvm-vgextra" }
+

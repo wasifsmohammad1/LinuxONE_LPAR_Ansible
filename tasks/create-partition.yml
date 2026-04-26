@@ -110,7 +110,7 @@
          adapter_name: "{{ item.adapter_name }}"
          adapter_port: "{{ item.port|default(0) }}"
          description: "{{ item.description }} (PCHID {{ item.pchid }})"
-         device-number: "{{ item.device_number | default(omit) }}"
+         device-number: "{{ item.device-number | default(omit) }}"
       loop: "{{ nics_for_partition }}"
       loop_control:
         label: "{{ item.name }} on {{ item.adapter_name }} port {{ item.port | default(0) }}"
