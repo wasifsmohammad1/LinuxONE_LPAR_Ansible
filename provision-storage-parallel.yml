@@ -1,0 +1,286 @@
+---
+# =============================================================================
+# Provision STORAGE for the partitions in vars/partitions.yml — IN PARALLEL.
+#
+# Scope (storage-only):
+#   for each partition `p` in parallel:
+#       1. Verify the partition already exists.
+#       2. Create FCP storage group       (zhmc_storage_group state=present)
+#       3. Create boot volume              (zhmc_storage_volume state=present)
+#       4. Create data volumes             (zhmc_storage_volume state=present, loop)
+#       5. Attach SG → partition           (zhmc_storage_group_attachment state=attached)
+#       6. Read back WWPNs                 (zhmc_storage_group state=facts expand=true)
+#
+# This playbook does NOT create or modify partitions or NICs. Use
+# provision-lpars-parallel.yml for that. Common workflows:
+#
+#   * "Add storage to an existing partition" — partition exists already, you
+#     just defined storage in vars/partitions.yml. Run this playbook.
+#   * "Recycle storage" — decommission with delete_storage_group=false (which
+#     keeps the SG), then later re-attach by running this playbook (idempotent
+#     SG/volume creates will no-op on the existing SG, and the attach step
+#     reattaches it to the freshly-rebuilt partition).
+#   * "Refresh WWPN report only" — re-running this on a fully-provisioned
+#     partition is safe; everything is idempotent and you get a fresh
+#     storage-report.txt / .json.
+#
+# Pattern (same as provision-lpars-parallel.yml):
+#   PLAY 1 (localhost) — pre-flight + add_host fan-out
+#   PLAY 2 (lpars_to_storage)  strategy: free   forks: N
+#   PLAY 3 (localhost) — consolidate + write reports
+#
+# Run
+# ---
+#   ansible-playbook -i inventory.yml provision-storage-parallel.yml \
+#       --ask-vault-pass --forks 4
+#
+#   # subset by name
+#   ansible-playbook -i inventory.yml provision-storage-parallel.yml \
+#       --ask-vault-pass --forks 4 -e "only=l1testw1,l1testw2"
+#
+#   # don't let one bad partition kill the rest
+#   ansible-playbook -i inventory.yml provision-storage-parallel.yml \
+#       --ask-vault-pass --forks 4 -e fail_fast=false
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# PLAY 1 — pre-flight + fan-out
+# -----------------------------------------------------------------------------
+- name: "Pre-flight (CPC + DPM + partition existence) and fan-out"
+  hosts: localhost
+  gather_facts: true
+
+  vars_files:
+    - vars/connection.yml
+    - vars/partitions.yml
+
+  vars:
+    only: ""                       # CSV of partition names; empty = all
+    hmc_auth:
+      userid: "{{ hmc_userid }}"
+      password: "{{ hmc_password }}"
+      verify: "{{ hmc_verify }}"
+
+  tasks:
+
+    - name: Capture python interpreter that has zhmcclient (= localhost's)
+      ansible.builtin.set_fact:
+        zhmc_python_interpreter: >-
+          {{ ansible_python.executable
+             | default(ansible_facts.discovered_interpreter_python
+             | default(ansible_playbook_python)) }}
+
+    - name: Show which interpreter the pseudo-hosts will use
+      ansible.builtin.debug:
+        msg: "Pseudo-hosts in PLAY 2 will use python: {{ zhmc_python_interpreter }}"
+
+    - name: PRE-FLIGHT — confirm the CPC exists and is in DPM mode
+      ibm.ibm_zhmc.zhmc_cpc:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        name: "{{ cpc_name }}"
+        state: facts
+      register: cpc_facts
+
+    - name: PRE-FLIGHT — assert CPC is DPM-enabled
+      ansible.builtin.assert:
+        that: cpc_facts.cpc['dpm-enabled'] | default(false) | bool
+        fail_msg: "CPC {{ cpc_name }} is in classic mode. This playbook requires DPM."
+
+    - name: "Filter partitions by --only=<csv> (default: all)"
+      ansible.builtin.set_fact:
+        partitions_for_storage: >-
+          {{ partitions if (only | length == 0)
+             else (partitions | selectattr('name', 'in', only.split(',')) | list) }}
+
+    - name: "Bail if --only didn't match anything"
+      ansible.builtin.fail:
+        msg: >
+          --only="{{ only }}" matched zero partitions. Available:
+          {{ partitions | map(attribute='name') | list }}
+      when:
+        - only | length > 0
+        - partitions_for_storage | length == 0
+
+    - name: "Reject any partition without a storage spec"
+      ansible.builtin.assert:
+        that: item.storage is defined and item.storage.group_name is defined and item.storage.boot_volume is defined
+        fail_msg: >
+          Partition '{{ item.name }}' is missing storage.{group_name|boot_volume}.
+          This playbook only handles partitions that declare storage in vars/partitions.yml.
+        quiet: true
+      loop: "{{ partitions_for_storage }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: PRE-FLIGHT — show partitions to be processed
+      ansible.builtin.debug:
+        msg:
+          - "About to provision storage for {{ partitions_for_storage | length }} partition(s) in parallel:"
+          - "{{ partitions_for_storage | map(attribute='name') | list }}"
+
+    # -------------------------------------------------------------------------
+    # FAN OUT — one host per partition
+    # -------------------------------------------------------------------------
+    - name: Add each partition as its own pseudo-host
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: lpars_for_storage
+        ansible_connection: local
+        ansible_python_interpreter: "{{ zhmc_python_interpreter }}"
+        partition_spec: "{{ item }}"
+        cpc_name: "{{ cpc_name }}"
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        fail_fast: "{{ fail_fast | default(true) }}"
+      loop: "{{ partitions_for_storage }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+# -----------------------------------------------------------------------------
+# PLAY 2 — provision storage in parallel
+# -----------------------------------------------------------------------------
+- name: "Provision storage in parallel"
+  hosts: lpars_for_storage
+  gather_facts: false
+  strategy: free
+  any_errors_fatal: false
+  tasks:
+
+    - name: "Provision storage for {{ inventory_hostname }}"
+      ansible.builtin.include_tasks: tasks/provision-one-storage.yml
+      vars:
+        p: "{{ partition_spec }}"
+
+# -----------------------------------------------------------------------------
+# PLAY 3 — consolidate, report, exit code
+# -----------------------------------------------------------------------------
+- name: "Consolidate storage results and write reports"
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/connection.yml
+    - vars/partitions.yml
+
+  tasks:
+
+    - name: Pull each partition's outcome out of hostvars
+      ansible.builtin.set_fact:
+        storage_results: >-
+          {{ groups['lpars_for_storage']
+             | default([])
+             | map('extract', hostvars, 'this_result')
+             | select('defined')
+             | list }}
+
+    - name: Identify hosts that died before producing a this_result
+      ansible.builtin.set_fact:
+        _hosts_without_result: >-
+          {{ (groups['lpars_for_storage'] | default([]))
+             | difference(storage_results | map(attribute='name') | list) }}
+
+    - name: Synthesize FAILED entries for hosts with no this_result
+      ansible.builtin.set_fact:
+        storage_results: >-
+          {{ storage_results + [{
+                'name':   item,
+                'status': 'FAILED',
+                'error':  'no this_result was set — host likely died inside an unhandled task; see play log'
+             }] }}
+      loop: "{{ _hosts_without_result }}"
+      when: _hosts_without_result | length > 0
+
+    - name: Console summary
+      ansible.builtin.debug:
+        msg: |
+          ================================================================
+          STORAGE PROVISIONING SUMMARY  ({{ storage_results | length }} partition(s))
+          CPC: {{ cpc_name }}    HMC: {{ hmc_host }}
+          ================================================================
+          {% for r in storage_results %}
+          {{ r.status }}  —  {{ r.name }}{% if r.status == 'OK' %}
+              Storage group  : {{ r.storage_group }}  ({{ r.connectivity }} paths)
+              Description    : {{ r.sg_description }}
+              Boot volume    : {{ r.boot_volume }} ({{ r.boot_size_gb }} GB)
+              Data volumes   : {% for v in r.data_volumes %}{{ v }} ({{ r.data_sizes_gb[loop.index0] }} GB){% if not loop.last %}, {% endif %}{% endfor %}
+
+              WWPNs          : {{ r.wwpns | join(', ') }}
+              Duration       : {{ r.duration_s | default('n/a') }} s{% else %}
+              ERROR          : {{ r.error | default('see play output') }}{% endif %}
+          {% endfor %}
+          ================================================================
+
+    - name: Write consolidated storage report (text — for the SAN ticket)
+      ansible.builtin.copy:
+        dest: "./storage-report.txt"
+        mode: "0644"
+        content: |
+          # ============================================================
+          # LinuxONE storage provisioning report (parallel run)
+          # CPC : {{ cpc_name }}
+          # HMC : {{ hmc_host }}
+          # Generated : {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+          # Total partitions : {{ storage_results | length }}
+          # Successes        : {{ storage_results | selectattr('status','equalto','OK') | list | length }}
+          # Failures         : {{ storage_results | selectattr('status','equalto','FAILED') | list | length }}
+          # ============================================================
+
+          {% for r in storage_results %}
+          [{{ r.name }}]
+          status         = {{ r.status }}
+          {% if r.status == 'OK' %}
+          partition      = {{ r.partition }}
+          storage_group  = {{ r.storage_group }}
+          connectivity   = {{ r.connectivity }}
+          boot_volume    = {{ r.boot_volume }}
+          boot_size_gb   = {{ r.boot_size_gb }}
+          data_volumes   = {{ r.data_volumes | join(', ') }}
+          data_sizes_gb  = {{ r.data_sizes_gb | join(', ') }}
+          duration_s     = {{ r.duration_s | default('n/a') }}
+          {% for w in r.wwpns %}
+          wwpn_{{ loop.index }}         = {{ w }}
+          {% endfor %}
+          {% else %}
+          error          = {{ r.error | default('see playbook output') }}
+          {% endif %}
+
+          {% endfor %}
+          # ============================================================
+          # SAN ZONING — give this whole list to your storage admin:
+          # ============================================================
+          {% for r in storage_results | selectattr('status','equalto','OK') %}
+          # {{ r.name }} ({{ r.storage_group }}):
+          {% for w in r.wwpns %}
+              {{ w }}
+          {% endfor %}
+          {% endfor %}
+
+    - name: Write consolidated storage report (JSON — for tooling / CMDB)
+      ansible.builtin.copy:
+        dest: "./storage-report.json"
+        mode: "0644"
+        content: "{{ {
+            'cpc':           cpc_name,
+            'hmc':           hmc_host,
+            'generated_utc': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+            'total':         storage_results | length,
+            'successes':     storage_results | selectattr('status','equalto','OK') | list | length,
+            'failures':      storage_results | selectattr('status','equalto','FAILED') | list | length,
+            'partitions':    storage_results
+          } | to_nice_json }}\n"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: |
+          Wrote ./storage-report.txt   (human / SAN-ticket format)
+                ./storage-report.json  (machine readable)
+
+    - name: Hard-fail at end if ANY partition's storage failed
+      ansible.builtin.fail:
+        msg: >
+          {{ storage_results | selectattr('status','equalto','FAILED') | list | length }}
+          partition(s) failed. See storage-report.txt for details.
+      when:
+        - storage_results | selectattr('status','equalto','FAILED') | list | length > 0
