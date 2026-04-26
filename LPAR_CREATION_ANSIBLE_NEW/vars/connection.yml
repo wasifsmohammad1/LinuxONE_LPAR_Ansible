@@ -1,0 +1,11 @@
+---
+# =============================================================================
+# HMC connection — secrets via Ansible Vault (see README.md).
+# =============================================================================
+hmc_host: "10.200.81.139"
+hmc_userid: "ak1usr3072"
+hmc_password: "2nafish"
+hmc_verify: false                   # set to /path/to/ca.pem in production
+
+# CPC (Central Processor Complex) name as it appears on the HMC.
+cpc_name: "P00BF028"

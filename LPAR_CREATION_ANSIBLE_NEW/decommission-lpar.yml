@@ -1,0 +1,15 @@
+---
+# DEPRECATED — single-LPAR teardown. Superseded by decommission-lpars.yml.
+#     ansible-playbook -i inventory.yml decommission-lpars.yml --ask-vault-pass
+#     ansible-playbook -i inventory.yml decommission-lpars.yml -e only=name1,name2
+- name: DEPRECATED — use decommission-lpars.yml instead
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - ansible.builtin.fail:
+        msg: |
+          decommission-lpar.yml has been replaced by decommission-lpars.yml.
+          Run:
+              ansible-playbook -i inventory.yml decommission-lpars.yml --ask-vault-pass
+              # or for a subset:
+              ansible-playbook -i inventory.yml decommission-lpars.yml -e only=app01,dev01

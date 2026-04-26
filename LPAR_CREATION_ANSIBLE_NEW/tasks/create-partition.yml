@@ -1,0 +1,302 @@
+---
+# =============================================================================
+# Per-partition provisioning logic. Included from provision-lpars.yml inside a
+# loop. Current partition: `p`.
+#
+# Every zhmc_* task takes hmc_host + hmc_auth explicitly (no module_defaults
+# group syntax — works on ibm.ibm_zhmc 1.x with ansible-core 2.14+).
+# =============================================================================
+
+- name: "[{{ p.name }}] Provision"
+  block:
+
+    # -------------------------------------------------------------------------
+    # 1) Partition (stopped)
+    #
+    # LinuxONE has only IFL engines (no CPs by definition), so we ALWAYS
+    # send ifl_processors and never cp_processors. Sending both — even a
+    # cp_processors=0 — triggers HTTP 400,15:
+    #   "Expected to find exactly one of: 'cp-processors' / 'ifl-processors'"
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Validate IFL count (LinuxONE is IFL-only)"
+      ansible.builtin.assert:
+        that: (p.ifl_processors | default(0) | int) > 0
+        fail_msg: >
+          Partition '{{ p.name }}' must specify ifl_processors > 0.
+          LinuxONE partitions cannot use CP engines — only IFLs.
+
+    - name: "[{{ p.name }}] Create / update partition"
+      ibm.ibm_zhmc.zhmc_partition:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ p.name }}"
+        state: stopped
+        properties:
+          description: "{{ p.description }}"
+          type: "{{ p.type | default('linux') }}"
+          processor_mode: "{{ p.processor_mode | default('shared') }}"
+          ifl_processors: "{{ p.ifl_processors | int }}"
+          initial_memory: "{{ p.initial_memory }}"
+          maximum_memory: "{{ p.maximum_memory | default(p.initial_memory) }}"
+
+    # -------------------------------------------------------------------------
+    # 2) Validate every PCHID in this partition's NIC list
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Assert every requested PCHID exists in CPC"
+      ansible.builtin.assert:
+        that: item.pchid in adapter_by_pchid
+        fail_msg: >
+          [{{ p.name }}] PCHID {{ item.pchid }} (NIC '{{ item.name }}')
+          NOT FOUND in CPC {{ cpc_name }}.
+          Available PCHIDs: {{ adapter_by_pchid.keys() | list | sort }}
+        quiet: true
+      loop: "{{ p.network_adapters }}"
+      loop_control:
+        label: "{{ item.name }} (PCHID {{ item.pchid }})"
+
+    # -------------------------------------------------------------------------
+    # 3) Resolve port URI for each NIC
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] DEBUG — full property keys of one looked-up adapter"
+      # Run only ONCE (for the first NIC of the first partition) so we can see
+      # which property name keys this collection version actually returns.
+      ansible.builtin.debug:
+        msg:
+          - "Adapter for PCHID {{ p.network_adapters[0].pchid }}:"
+          - "Top-level keys: {{ adapter_by_pchid[p.network_adapters[0].pchid].keys() | list | sort }}"
+      run_once: true
+      when:
+        - p.network_adapters | length > 0
+        - p.network_adapters[0].pchid in adapter_by_pchid
+
+    - name: "[{{ p.name }}] Resolve adapter port URIs (tolerant of property naming)"
+      ansible.builtin.set_fact:
+        nics_for_partition: >-
+          {{ nics_for_partition | default([]) + [
+                item | combine({
+                  'adapter_uri':  ad['object-uri']
+                                    | default(ad['object_uri']
+                                    | default(ad['uri'])),
+                  'adapter_name': ad['name'],
+                  'port_uri':     (ad['network-port-uris']
+                                    | default(ad['network_port_uris']
+                                    | default(ad['port-uris']
+                                    | default([]))))[item.port | default(0)]
+                })
+             ] }}
+      loop: "{{ p.network_adapters }}"
+      vars:
+        ad: "{{ adapter_by_pchid[item.pchid] }}"
+      loop_control:
+        label: "{{ item.name }} (PCHID {{ item.pchid }})"
+
+    # -------------------------------------------------------------------------
+    # 4) Create NICs
+    # -------------------------------------------------------------------------
+    # zhmc_nic in ibm.ibm_zhmc 1.10 whitelists HMC-API-native property names
+    # (with DASHES). Underscore versions get rejected with:
+    #   "Property 'network_adapter_port_uri' is not allowed in the 'properties' module parameter."
+    # (Note: read operations return underscore keys — different convention.)
+    - name: "[{{ p.name }}] Create NIC"
+      ibm.ibm_zhmc.zhmc_nic:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        partition_name: "{{ p.name }}"
+        name: "{{ item.name }}"
+        state: present
+        properties:
+         adapter_name: "{{ item.adapter_name }}"
+         adapter_port: "{{ item.port|default(0) }}"
+         description: "{{ item.description }} (PCHID {{ item.pchid }})"
+         device-number: "{{ item.device_number | default(omit) }}"
+      loop: "{{ nics_for_partition }}"
+      loop_control:
+        label: "{{ item.name }} on {{ item.adapter_name }} port {{ item.port | default(0) }}"
+
+    - name: "[{{ p.name }}] Reset per-partition NIC accumulator"
+      ansible.builtin.set_fact:
+        nics_for_partition: []
+
+    # -------------------------------------------------------------------------
+    # 5) FCP storage group
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Create FCP storage group"
+      ibm.ibm_zhmc.zhmc_storage_group:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ p.storage.group_name }}"
+        state: present
+        properties:
+          description: "{{ p.storage.group_description | default(p.storage.group_name) }}"
+          type: "fcp"
+          shared: false
+          connectivity: "{{ p.storage.connectivity | default(2) }}"
+          max-partitions: "{{ p.storage.max_partitions | default(1) }}"
+      register: sg_create_result
+
+    # HMC takes a few seconds to make a freshly-created SG visible to
+    # name lookups in subsequent API calls. Without this pause the next
+    # `Create boot volume` task often hits "NotFound: StorageGroup ...".
+    - name: "[{{ p.name }}] Wait for HMC to commit the new SG"
+      ansible.builtin.pause:
+        seconds: 10
+      when: sg_create_result.changed | default(false) | bool
+
+    # -------------------------------------------------------------------------
+    # 6) Volumes (boot + data) — with retries to absorb any remaining
+    #    eventual-consistency hiccups
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Create boot volume"
+      ibm.ibm_zhmc.zhmc_storage_volume:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        storage_group_name: "{{ p.storage.group_name }}"
+        name: "{{ p.storage.boot_volume.name }}"
+        state: present
+        properties:
+          description: "{{ p.storage.boot_volume.description | default('Boot disk') }}"
+          size: "{{ p.storage.boot_volume.size }}"
+          usage: "boot"
+      register: boot_vol_result
+      retries: 6
+      delay: 5
+      until: boot_vol_result is succeeded
+
+    - name: "[{{ p.name }}] Create data volumes"
+      ibm.ibm_zhmc.zhmc_storage_volume:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        storage_group_name: "{{ p.storage.group_name }}"
+        name: "{{ item.name }}"
+        state: present
+        properties:
+          description: "{{ item.description | default(item.name) }}"
+          size: "{{ item.size }}"
+          usage: "data"
+      loop: "{{ p.storage.data_volumes | default([]) }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.size }} GB)"
+      register: data_vol_result
+      retries: 6
+      delay: 5
+      until: data_vol_result is succeeded
+
+    # -------------------------------------------------------------------------
+    # 7) Attach SG to partition (this is what creates VSRs + assigns WWPNs)
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Attach storage group → partition"
+      ibm.ibm_zhmc.zhmc_storage_group_attachment:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        storage_group_name: "{{ p.storage.group_name }}"
+        partition_name: "{{ p.name }}"
+        state: attached
+      register: sg_attach_result
+      retries: 6
+      delay: 5
+      until: sg_attach_result is succeeded
+
+    # The HMC needs ~30-60s after attach to materialize the virtual storage
+    # resources (which is where the WWPNs live). Wait before reading them back.
+    - name: "[{{ p.name }}] Wait for HMC to mint VSRs/WWPNs after attach"
+      ansible.builtin.pause:
+        seconds: 30
+      when: sg_attach_result.changed | default(false) | bool
+
+    # -------------------------------------------------------------------------
+    # 8) Boot from boot volume
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Set partition boot device"
+      ibm.ibm_zhmc.zhmc_partition:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ p.name }}"
+        state: stopped
+        properties:
+          boot_device: "none"
+            #boot_storage_group_name: "{{ p.storage.group_name }}"
+            #boot_storage_volume_name: "{{ p.storage.boot_volume.name }}"
+
+    # -------------------------------------------------------------------------
+    # 9) Read back WWPNs
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Fetch storage group WWPNs"
+      ibm.ibm_zhmc.zhmc_storage_group:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ p.storage.group_name }}"
+        state: facts
+        expand: true
+      register: sg_facts
+      retries: 10
+      delay: 15
+    - name: "[{{ p.name }}] Extract WWPNs from storage group"
+      ansible.builtin.set_fact:
+        this_wwpns: >-
+          {{
+            sg_facts.storage_group['virtual-storage-resources']
+            | default([])
+            | selectattr('world-wide-port-name', 'defined')
+            | map(attribute='world-wide-port-name')
+            | list
+          }}
+    - name: "[{{ p.name }}] Capture provisioning result"
+      ansible.builtin.set_fact:
+        provisioning_results: >-
+          {{ provisioning_results | default([]) + [ {
+            'name': p.name,
+            'description': p.description,
+            'ifls': p.ifl_processors | default(0),
+            'memory_mb': p.initial_memory,
+            'storage_group': p.storage.group_name,
+            'connectivity': p.storage.connectivity | default(2),
+            'boot_volume': p.storage.boot_volume.name,
+            'data_volumes': p.storage.data_volumes | default([]) | map(attribute='name') | list,
+            'nics': p.network_adapters | map(attribute='name') | list,
+            'pchids': p.network_adapters | map(attribute='pchid') | list,
+            'wwpns': this_wwpns, 
+            'status': 'OK'
+          } ] }}
+    # -------------------------------------------------------------------------
+    # 10) Optional autostart
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Start partition"
+      ibm.ibm_zhmc.zhmc_partition:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ p.name }}"
+        state: active
+      when: p.autostart | default(false) | bool
+
+    - name: "[{{ p.name }}] Pause before next partition (rate-limit gentleness)"
+      ansible.builtin.pause:
+        seconds: "{{ inter_partition_pause | default(5) }}"
+      when: not ansible_check_mode
+
+  # ===========================================================================
+  # Rescue: capture failure, optionally continue with the next partition
+  # ===========================================================================
+  rescue:
+
+    - name: "[{{ p.name }}] FAILED — recording for the summary"
+      ansible.builtin.set_fact:
+        provisioning_results: >-
+          {{ provisioning_results | default([]) + [{
+              'name':   p.name,
+              'status': 'FAILED',
+              'error':  ansible_failed_result.msg | default('see prior task output')
+          }] }}
+
+    - name: "[{{ p.name }}] Stop the entire batch (fail_fast is true)"
+      ansible.builtin.fail:
+        msg: "Aborting because fail_fast=true and {{ p.name }} failed."
+      when: fail_fast | default(true) | bool

@@ -1,0 +1,9 @@
+---
+# All HMC API calls run from the Ansible control node, so localhost is the
+# only "host" we need. The actual IBM Z target (HMC + CPC) is reached
+# over HTTPS to the HMC REST endpoint.
+all:
+  hosts:
+    localhost:
+      ansible_connection: local
+        #ansible_python_interpreter: /usr/bin/python3.

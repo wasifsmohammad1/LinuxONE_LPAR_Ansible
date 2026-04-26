@@ -1,0 +1,39 @@
+---
+# Per-partition teardown. Included from decommission-lpars.yml.
+# hmc_host + hmc_auth passed explicitly to each task (no module_defaults).
+
+- name: "[{{ p.name }}] Stop the partition (if running)"
+  ibm.ibm_zhmc.zhmc_partition:
+    hmc_host: "{{ hmc_host }}"
+    hmc_auth: "{{ hmc_auth }}"
+    cpc_name: "{{ cpc_name }}"
+    name: "{{ p.name }}"
+    state: stopped
+  ignore_errors: true
+
+- name: "[{{ p.name }}] Detach storage group"
+  ibm.ibm_zhmc.zhmc_storage_group_attachment:
+    hmc_host: "{{ hmc_host }}"
+    hmc_auth: "{{ hmc_auth }}"
+    cpc_name: "{{ cpc_name }}"
+    storage_group_name: "{{ p.storage.group_name }}"
+    partition_name: "{{ p.name }}"
+    state: detached
+  ignore_errors: true
+
+- name: "[{{ p.name }}] Delete storage group (and all volumes)"
+  ibm.ibm_zhmc.zhmc_storage_group:
+    hmc_host: "{{ hmc_host }}"
+    hmc_auth: "{{ hmc_auth }}"
+    cpc_name: "{{ cpc_name }}"
+    name: "{{ p.storage.group_name }}"
+    state: absent
+  ignore_errors: true
+
+- name: "[{{ p.name }}] Delete partition"
+  ibm.ibm_zhmc.zhmc_partition:
+    hmc_host: "{{ hmc_host }}"
+    hmc_auth: "{{ hmc_auth }}"
+    cpc_name: "{{ cpc_name }}"
+    name: "{{ p.name }}"
+    state: absent

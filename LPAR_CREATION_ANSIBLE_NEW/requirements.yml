@@ -1,0 +1,8 @@
+---
+# IBM Z HMC client collection. Requires Python 'zhmcclient' on the control node:
+#   pip install zhmcclient
+collections:
+  - name: ibm.ibm_zhmc
+    version: ">=1.9.0"
+  - name: ansible.posix
+    version: ">=1.5.0"

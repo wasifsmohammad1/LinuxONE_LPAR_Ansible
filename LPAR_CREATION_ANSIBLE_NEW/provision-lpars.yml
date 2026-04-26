@@ -1,0 +1,260 @@
+---
+# =============================================================================
+# Provision MULTIPLE LinuxONE partitions in one playbook run.
+#
+# Lifecycle:
+#   - Resolve every PCHID in the CPC ONCE  (cached for all partitions).
+#   - Loop over vars/partitions.yml; each iteration runs tasks/create-partition.yml.
+#   - Per-partition failures rescue and (depending on fail_fast) either abort
+#     the batch or continue with the next partition.
+#   - At the end print a consolidated summary AND write a single
+#     provisioning-report.txt with every partition's WWPNs — perfect for
+#     a single SAN-team ticket covering the whole batch.
+#
+# Run:
+#   ansible-galaxy collection install -r requirements.yml
+#   pip install zhmcclient
+#   ansible-playbook -i inventory.yml provision-lpars.yml --ask-vault-pass
+#
+# Optional flags:
+#   -e fail_fast=false           continue on per-partition failures
+#   -e inter_partition_pause=10  longer breather between partitions
+#   --limit-partitions=app01,db01    (no — Ansible doesn't filter loops natively;
+#                                     use --extra-vars partitions=... or comment
+#                                     entries in vars/partitions.yml)
+# =============================================================================
+
+- name: Provision multiple LinuxONE partitions
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/connection.yml
+      #    - vars/vault.yml          # holds vault_hmc_password (encrypted)
+    - vars/partitions.yml
+
+  # NO module_defaults block here — that requires ibm.ibm_zhmc >= 1.9 +
+  # ansible-core >= 2.15. We instead define hmc_auth as a single play-level
+  # var that gets passed to every zhmc_* task explicitly, which works on
+  # any combination.
+  vars:
+    # NOTE: ibm.ibm_zhmc 1.10's zhmc_* modules accept these auth keys:
+    #   userid, password, session_id, ca_certs, verify
+    # (NOT verify_cert — that's the newer ibm_zhmc 1.11+ name).
+    hmc_auth:
+      userid: "{{ hmc_userid }}"
+      password: "{{ hmc_password }}"
+      verify: "{{ hmc_verify }}"
+
+  tasks:
+
+    # =========================================================================
+    # PHASE A — Pre-flight (read-only)
+    # =========================================================================
+    - name: PRE-FLIGHT — confirm the CPC exists and is in DPM mode
+      ibm.ibm_zhmc.zhmc_cpc:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        name: "{{ cpc_name }}"
+        state: facts
+      register: cpc_facts
+
+    - name: PRE-FLIGHT — assert CPC is DPM-enabled (this playbook needs DPM)
+      ansible.builtin.assert:
+        that: cpc_facts.cpc['dpm-enabled'] | default(false) | bool
+        fail_msg: >
+          CPC {{ cpc_name }} is in classic mode. This playbook requires DPM
+          (storage groups + partitions). Either flip the CPC to DPM or use
+          a different playbook that targets classic-mode LPARs.
+
+    - name: PRE-FLIGHT — show partitions to be processed
+      ansible.builtin.debug:
+        msg:
+          - "About to process {{ partitions | length }} partition(s):"
+          - "{{ partitions | map(attribute='name') | list }}"
+
+    # =========================================================================
+    # PHASE B — Resolve adapters ONCE for the whole batch
+    # =========================================================================
+    - name: List all adapters in the CPC (with full properties)
+      ibm.ibm_zhmc.zhmc_adapter_list:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        full_properties: true
+      register: all_adapters
+
+    - name: DEBUG — confirm zhmc_adapter_list actually returned adapters
+      ansible.builtin.assert:
+        that: all_adapters.adapters | length > 0
+        fail_msg: >
+          zhmc_adapter_list returned 0 adapters for CPC {{ cpc_name }}.
+          Either the CPC name is wrong (case-sensitive!) or the HMC user
+          {{ hmc_userid }} lacks 'List Adapters' / 'Adapter Administrator'
+          permission. Check the HMC GUI -> User Management -> {{ hmc_userid }}
+          -> Tasks Roles.
+
+    - name: DEBUG — show property keys of the first adapter (helps us see naming convention)
+      ansible.builtin.debug:
+        msg:
+          - "First adapter name: {{ all_adapters.adapters[0].name | default(all_adapters.adapters[0]['name']) }}"
+          - "Available property keys (look for adapter-id or adapter_id):"
+          - "{{ all_adapters.adapters[0].keys() | list | sort }}"
+
+    # =========================================================================
+    # Build PCHID lookup with a LOOP instead of a fragile dict-comprehension.
+    # Handles both 'adapter-id' (dashes — HMC API native) and 'adapter_id'
+    # (underscores — Python-style, used by some module versions) without
+    # caring which one this version of ibm.ibm_zhmc actually returns.
+    # =========================================================================
+    - name: Initialize empty PCHID lookup
+      ansible.builtin.set_fact:
+        adapter_by_pchid: {}
+
+    - name: Add each adapter to PCHID lookup (loop, tolerant of property naming)
+      ansible.builtin.set_fact:
+        adapter_by_pchid: >-
+          {{ adapter_by_pchid | combine({
+              (item['adapter-id'] | default(item['adapter_id'] | default(''))): item
+          }) }}
+      loop: "{{ all_adapters.adapters }}"
+      loop_control:
+        label: "{{ item.name | default(item['name']) }} → PCHID {{ item['adapter-id'] | default(item['adapter_id'] | default('(none)')) }}"
+      when:
+        - (item['adapter-id'] is defined) or (item['adapter_id'] is defined)
+        - (item['adapter-id'] | default(item['adapter_id'] | default('')) | length) > 0
+
+    - name: DEBUG — print the resolved PCHID list (sanity check before validation)
+      ansible.builtin.debug:
+        msg: "Resolved {{ adapter_by_pchid | length }} PCHIDs in CPC {{ cpc_name }}: {{ adapter_by_pchid.keys() | list | sort }}"
+
+    - name: Fail clearly if no PCHIDs were resolved at all
+      ansible.builtin.fail:
+        msg: |
+          zhmc_adapter_list returned {{ all_adapters.adapters | length }} adapter(s),
+          but NONE had 'adapter-id' or 'adapter_id' set.
+
+          This usually means:
+            1. Adapters returned without full properties — re-check that
+               full_properties: true is being honored by this collection version
+            2. The HMC user lacks 'View Adapter Properties' permission
+            3. The property name in this collection version is different —
+               look at the DEBUG output above for the actual property keys
+      when: adapter_by_pchid | length == 0
+
+    - name: Pre-validate every PCHID across every partition (catch errors EARLY)
+      ansible.builtin.assert:
+        that: nic.pchid in adapter_by_pchid
+        fail_msg: >
+          Partition '{{ outer.name }}' references PCHID {{ nic.pchid }} which
+          does NOT exist in CPC {{ cpc_name }}. Aborting before we change anything.
+          Available PCHIDs: {{ adapter_by_pchid.keys() | list | sort }}
+        quiet: true
+      loop: "{{ partitions | subelements('network_adapters') }}"
+      loop_control:
+        loop_var: pair
+        label: "{{ pair.0.name }} → {{ pair.1.name }} (PCHID {{ pair.1.pchid }})"
+      vars:
+        outer: "{{ pair.0 }}"
+        nic:   "{{ pair.1 }}"
+
+    # =========================================================================
+    # PHASE C — Loop over partitions, run the per-partition tasks file
+    # =========================================================================
+    - name: Initialize the run-wide results collector
+      ansible.builtin.set_fact:
+        provisioning_results: []
+
+    - name: "Provision each partition"
+      ansible.builtin.include_tasks: tasks/create-partition.yml
+      vars:
+        p: "{{ this_partition }}"
+      loop: "{{ partitions }}"
+      loop_control:
+        loop_var: this_partition
+        label: "{{ this_partition.name }}"
+
+    # =========================================================================
+    # PHASE D — Consolidated summary + single report file for SAN team
+    # =========================================================================
+    - name: Print the consolidated summary
+      ansible.builtin.debug:
+        msg: |
+          ================================================================
+          MULTI-LPAR PROVISIONING SUMMARY  ({{ provisioning_results | length }} partition(s))
+          CPC: {{ cpc_name }}    HMC: {{ hmc_host }}
+          ================================================================
+          {% for r in provisioning_results %}
+          {{ r.status }}  —  {{ r.name }}{% if r.status == 'OK' %}
+              IFLs / Memory  : {{ r.ifls }} IFL  /  {{ r.memory_mb }} MB
+              Storage group  : {{ r.storage_group }}  ({{ r.connectivity }} paths)
+              Boot volume    : {{ r.boot_volume }}
+              Data volumes   : {{ r.data_volumes | join(', ') }}
+              NICs           : {{ r.nics | join(', ') }}
+              PCHIDs         : {{ r.pchids | join(', ') }}
+              WWPNs          : {{ r.wwpns | join(', ') }}{% else %}
+              ERROR          : {{ r.error | default('see playbook output above') }}{% endif %}
+          {% endfor %}
+          ================================================================
+
+    - name: Write consolidated provisioning report (one file for the whole batch)
+      ansible.builtin.copy:
+        dest: "./provisioning-report.txt"
+        mode: "0644"
+        content: |
+          # ============================================================
+          # LinuxONE multi-LPAR provisioning report
+          # CPC : {{ cpc_name }}
+          # HMC : {{ hmc_host }}
+          # Generated : {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+          # Total partitions processed : {{ provisioning_results | length }}
+          # Successes : {{ provisioning_results | selectattr('status','equalto','OK') | list | length }}
+          # Failures  : {{ provisioning_results | selectattr('status','equalto','FAILED') | list | length }}
+          # ============================================================
+
+          {% for r in provisioning_results %}
+          [{{ r.name }}]
+          status         = {{ r.status }}
+          {% if r.status == 'OK' %}
+          description    = {{ r.description | default('') }}
+          ifls           = {{ r.ifls }}
+          memory_mb      = {{ r.memory_mb }}
+          storage_group  = {{ r.storage_group }}
+          connectivity   = {{ r.connectivity }}
+          boot_volume    = {{ r.boot_volume }}
+          data_volumes   = {{ r.data_volumes | join(', ') }}
+          nics           = {{ r.nics | join(', ') }}
+          pchids         = {{ r.pchids | join(', ') }}
+          {% for w in r.wwpns %}
+          wwpn_{{ loop.index }}         = {{ w }}
+          {% endfor %}
+          {% else %}
+          error          = {{ r.error | default('see playbook output') }}
+          {% endif %}
+
+          {% endfor %}
+          # ============================================================
+          # SAN ZONING — give this whole list to your storage admin:
+          # ============================================================
+          {% for r in provisioning_results | selectattr('status','equalto','OK') %}
+          # {{ r.name }} ({{ r.storage_group }}):
+          {% for w in r.wwpns %}
+              {{ w }}
+          {% endfor %}
+          {% endfor %}
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: |
+          Wrote ./provisioning-report.txt — drop this whole file into your
+          SAN team's ticket. The "SAN ZONING" section at the bottom has every
+          WWPN that needs zoning, grouped by partition.
+
+    - name: Hard-fail at end if ANY partition failed (and fail_fast was off)
+      ansible.builtin.fail:
+        msg: >
+          {{ provisioning_results | selectattr('status','equalto','FAILED') | list | length }}
+          partition(s) failed. See provisioning-report.txt for details.
+      when:
+        - not (fail_fast | default(true) | bool)
+        - provisioning_results | selectattr('status','equalto','FAILED') | list | length > 0

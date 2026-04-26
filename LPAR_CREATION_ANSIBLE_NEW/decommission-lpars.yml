@@ -1,0 +1,54 @@
+---
+# =============================================================================
+# Tear down EVERY partition listed in vars/partitions.yml.
+# Stops, detaches SG, deletes SG (and volumes), deletes the partition.
+#
+#   ansible-playbook -i inventory.yml decommission-lpars.yml --ask-vault-pass
+#   ansible-playbook -i inventory.yml decommission-lpars.yml \
+#       -e "only=linuxone-dev01,linuxone-app02"   # subset by name
+# =============================================================================
+
+- name: Decommission multiple LinuxONE partitions
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/connection.yml
+    - vars/partitions.yml
+
+  vars:
+    only: ""                                 # CSV of names; empty = all
+    # No module_defaults group (incompatible with ibm.ibm_zhmc 1.8 + ansible 2.14).
+    # We pass hmc_auth explicitly in each per-partition delete task instead.
+    hmc_auth:
+      userid: "{{ hmc_userid }}"
+      password: "{{ hmc_password }}"
+      verify_cert: "{{ hmc_verify }}"
+
+  tasks:
+
+    - name: "Filter partitions by --only=<csv> (default: all)"
+      ansible.builtin.set_fact:
+        partitions_to_destroy: >-
+          {{ partitions if (only | length == 0)
+             else (partitions | selectattr('name', 'in', only.split(',')) | list) }}
+
+    - name: Confirm intent (Ctrl-C now if this wasn't deliberate)
+      ansible.builtin.pause:
+        prompt: |
+          About to DESTROY {{ partitions_to_destroy | length }} partition(s):
+          {% for p in partitions_to_destroy %}
+            - {{ p.name }}   (storage group: {{ p.storage.group_name }})
+          {% endfor %}
+
+          This DELETES the partitions and ALL volumes inside their storage groups.
+          Press ENTER to continue, Ctrl-C then 'a' to abort.
+
+    - name: Destroy each partition
+      ansible.builtin.include_tasks: tasks/delete-partition.yml
+      vars:
+        p: "{{ this_partition }}"
+      loop: "{{ partitions_to_destroy }}"
+      loop_control:
+        loop_var: this_partition
+        label: "{{ this_partition.name }}"
