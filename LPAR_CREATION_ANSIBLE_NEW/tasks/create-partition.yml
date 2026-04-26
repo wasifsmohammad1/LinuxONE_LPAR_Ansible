@@ -248,23 +248,21 @@
             | map(attribute='world-wide-port-name')
             | list
           }}
-    - name: "[{{ p.name }}] Capture provisioning result"
+    - name: "[{{ p.name }}] Save result (parallel-safe)"
       ansible.builtin.set_fact:
-        provisioning_results: >-
-          {{ provisioning_results | default([]) + [ {
-            'name': p.name,
-            'description': p.description,
-            'ifls': p.ifl_processors | default(0),
-            'memory_mb': p.initial_memory,
-            'storage_group': p.storage.group_name,
-            'connectivity': p.storage.connectivity | default(2),
-            'boot_volume': p.storage.boot_volume.name,
-            'data_volumes': p.storage.data_volumes | default([]) | map(attribute='name') | list,
-            'nics': p.network_adapters | map(attribute='name') | list,
-            'pchids': p.network_adapters | map(attribute='pchid') | list,
-            'wwpns': this_wwpns, 
-            'status': 'OK'
-          } ] }}
+        this_result:
+          name: "{{ p.name }}"
+          description: "{{ p.description }}"
+          ifls: "{{ p.ifl_processors | default(0) }}"
+          memory_mb: "{{ p.initial_memory }}"
+          storage_group: "{{ p.storage.group_name }}"
+          connectivity: "{{ p.storage.connectivity | default(2) }}"
+          boot_volume: "{{ p.storage.boot_volume.name }}"
+          data_volumes: "{{ p.storage.data_volumes | default([]) | map(attribute='name') | list }}"
+          nics: "{{ p.network_adapters | map(attribute='name') | list }}"
+          pchids: "{{ p.network_adapters | map(attribute='pchid') | list }}"
+          wwpns: "{{ this_wwpns }}"
+          status: "OK"
     # -------------------------------------------------------------------------
     # 10) Optional autostart
     # -------------------------------------------------------------------------
