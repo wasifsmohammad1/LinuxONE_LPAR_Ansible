@@ -55,7 +55,13 @@
 # -----------------------------------------------------------------------------
 - name: "Pre-flight and fan-out — runs once on the control node"
   hosts: localhost
-  gather_facts: false
+  # Gather facts so we can see which python interpreter Ansible actually
+  # chose for localhost (it's the one we know has zhmcclient — every zhmc_*
+  # task in this very play depends on it). We pin the pseudo-hosts in PLAY 2
+  # to the same interpreter so they don't accidentally land on a system
+  # python without zhmcclient (the symptom is a ModuleNotFoundError on every
+  # parallel host).
+  gather_facts: true
 
   vars_files:
     - vars/connection.yml
@@ -68,6 +74,17 @@
       verify: "{{ hmc_verify }}"
 
   tasks:
+
+    - name: Capture the python interpreter that has zhmcclient (= localhost's)
+      ansible.builtin.set_fact:
+        zhmc_python_interpreter: >-
+          {{ ansible_python.executable
+             | default(ansible_facts.discovered_interpreter_python
+             | default(ansible_playbook_python)) }}
+
+    - name: Show which interpreter the pseudo-hosts will use
+      ansible.builtin.debug:
+        msg: "Pseudo-hosts in PLAY 2 will use python: {{ zhmc_python_interpreter }}"
 
     - name: PRE-FLIGHT — confirm the CPC exists and is in DPM mode
       ibm.ibm_zhmc.zhmc_cpc:
@@ -155,7 +172,13 @@
         name: "{{ item.name }}"
         groups: lpars_to_provision
         ansible_connection: local
-        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+        # Use the same python that already worked for localhost in PLAY 1.
+        # If we used ansible_playbook_python here we'd land on the python
+        # that ran ansible-playbook itself, which often differs from the
+        # interpreter ansible auto-discovered for localhost — and zhmcclient
+        # is only installed in one of them. Symptom: ModuleNotFoundError:
+        # No module named 'zhmcclient' at "Create / update partition".
+        ansible_python_interpreter: "{{ zhmc_python_interpreter }}"
         partition_spec: "{{ item }}"
         adapter_by_pchid: "{{ adapter_by_pchid }}"
         cpc_name: "{{ cpc_name }}"

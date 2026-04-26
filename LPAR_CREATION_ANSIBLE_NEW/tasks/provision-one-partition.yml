@@ -131,9 +131,14 @@
           max-partitions: "{{ p.storage.max_partitions | default(1) }}"
       register: sg_create_result
 
+    # NOTE: ansible.builtin.pause is not compatible with `strategy: free`
+    # ("pause module bypasses the host loop, which is currently not supported
+    # in the free strategy"). We use `command: sleep` instead — that runs
+    # per-host inside its own worker, so each parallel partition pauses
+    # independently.
     - name: "[{{ p.name }}] Wait for HMC to commit the new SG"
-      ansible.builtin.pause:
-        seconds: 10
+      ansible.builtin.command: sleep 10
+      changed_when: false
       when: sg_create_result.changed | default(false) | bool
 
     # -------------------------------------------------------------------------
@@ -193,8 +198,8 @@
       until: sg_attach_result is succeeded
 
     - name: "[{{ p.name }}] Wait for HMC to mint VSRs/WWPNs after attach"
-      ansible.builtin.pause:
-        seconds: 30
+      ansible.builtin.command: sleep 30
+      changed_when: false
       when: sg_attach_result.changed | default(false) | bool
 
     # -------------------------------------------------------------------------
