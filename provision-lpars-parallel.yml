@@ -1,0 +1,346 @@
+---
+# =============================================================================
+# Provision MULTIPLE LinuxONE partitions in TRUE parallel.
+#
+# Why this file exists
+# --------------------
+# provision-lpars.yml tried to parallelize with `async + include_tasks`, which
+# Ansible does not actually support — the include still runs serially, and
+# `set_fact` from inside the async wrapper never makes it back to the
+# controller, so the consolidated report comes out empty.
+#
+# This playbook uses the canonical Ansible pattern for "do N things in
+# parallel against the same backend":
+#
+#   PLAY 1 (localhost) — pre-flight
+#       * verify CPC + DPM
+#       * list adapters ONCE → cache adapter_by_pchid
+#       * pre-validate every partition's PCHIDs
+#       * add_host each partition into a dynamic group `lpars_to_provision`,
+#         carrying the partition spec + shared facts as host vars.
+#
+#   PLAY 2 (lpars_to_provision)  strategy: free   forks: N
+#       * each "host" is really localhost, but Ansible's fork engine treats
+#         them as independent and runs them concurrently up to --forks.
+#       * each host runs tasks/provision-one-partition.yml end-to-end.
+#       * each host stores its outcome in `this_result` (per-host fact —
+#         no cross-talk).
+#
+#   PLAY 3 (localhost) — consolidator
+#       * pulls this_result from every host out of hostvars.
+#       * prints the summary, writes provisioning-report.txt AND
+#         provisioning-report.json.
+#       * exits non-zero if any partition failed.
+#
+# Run
+# ---
+#   ansible-galaxy collection install -r requirements.yml
+#   pip install zhmcclient
+#
+#   # default — 8 partitions in flight at once
+#   ansible-playbook -i inventory.yml provision-lpars-parallel.yml \
+#       --ask-vault-pass --forks 8
+#
+#   # cap parallelism (e.g. an HMC that hates concurrent storage-group churn)
+#   ansible-playbook -i inventory.yml provision-lpars-parallel.yml \
+#       --ask-vault-pass --forks 2
+#
+#   # don't let one bad partition kill the rest
+#   ansible-playbook -i inventory.yml provision-lpars-parallel.yml \
+#       --ask-vault-pass -e fail_fast=false
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# PLAY 1 — pre-flight + fan-out
+# -----------------------------------------------------------------------------
+- name: "Pre-flight and fan-out — runs once on the control node"
+  hosts: localhost
+  # Gather facts so we can see which python interpreter Ansible actually
+  # chose for localhost (it's the one we know has zhmcclient — every zhmc_*
+  # task in this very play depends on it). We pin the pseudo-hosts in PLAY 2
+  # to the same interpreter so they don't accidentally land on a system
+  # python without zhmcclient (the symptom is a ModuleNotFoundError on every
+  # parallel host).
+  gather_facts: true
+
+  vars_files:
+    - vars/connection.yml
+    - vars/partitions.yml
+
+  vars:
+    hmc_auth:
+      userid: "{{ hmc_userid }}"
+      password: "{{ hmc_password }}"
+      verify: "{{ hmc_verify }}"
+
+  tasks:
+
+    - name: Capture the python interpreter that has zhmcclient (= localhost's)
+      ansible.builtin.set_fact:
+        zhmc_python_interpreter: >-
+          {{ ansible_python.executable
+             | default(ansible_facts.discovered_interpreter_python
+             | default(ansible_playbook_python)) }}
+
+    - name: Show which interpreter the pseudo-hosts will use
+      ansible.builtin.debug:
+        msg: "Pseudo-hosts in PLAY 2 will use python: {{ zhmc_python_interpreter }}"
+
+    - name: PRE-FLIGHT — confirm the CPC exists and is in DPM mode
+      ibm.ibm_zhmc.zhmc_cpc:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        name: "{{ cpc_name }}"
+        state: facts
+      register: cpc_facts
+
+    - name: PRE-FLIGHT — assert CPC is DPM-enabled
+      ansible.builtin.assert:
+        that: cpc_facts.cpc['dpm-enabled'] | default(false) | bool
+        fail_msg: >
+          CPC {{ cpc_name }} is in classic mode. This playbook requires DPM.
+
+    - name: PRE-FLIGHT — show partitions to be processed
+      ansible.builtin.debug:
+        msg:
+          - "About to fan out {{ partitions | length }} partition(s) in parallel:"
+          - "{{ partitions | map(attribute='name') | list }}"
+          - "Effective parallelism = min(--forks, {{ partitions | length }})"
+
+    - name: List all adapters in the CPC ONCE (full properties)
+      ibm.ibm_zhmc.zhmc_adapter_list:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        full_properties: true
+      register: all_adapters
+
+    - name: Sanity — got at least one adapter
+      ansible.builtin.assert:
+        that: all_adapters.adapters | length > 0
+        fail_msg: >
+          zhmc_adapter_list returned 0 adapters for CPC {{ cpc_name }}.
+          Check CPC name (case-sensitive) and that {{ hmc_userid }} has
+          'List Adapters' / 'View Adapter Properties' permission.
+
+    - name: Initialize empty PCHID lookup
+      ansible.builtin.set_fact:
+        adapter_by_pchid: {}
+
+    - name: Build PCHID lookup (tolerant of dash/underscore property naming)
+      ansible.builtin.set_fact:
+        adapter_by_pchid: >-
+          {{ adapter_by_pchid | combine({
+              (item['adapter-id'] | default(item['adapter_id'] | default(''))): item
+          }) }}
+      loop: "{{ all_adapters.adapters }}"
+      loop_control:
+        label: "{{ item.name | default(item['name']) }} → PCHID {{ item['adapter-id'] | default(item['adapter_id'] | default('(none)')) }}"
+      when:
+        - (item['adapter-id'] is defined) or (item['adapter_id'] is defined)
+        - (item['adapter-id'] | default(item['adapter_id'] | default('')) | length) > 0
+
+    - name: Fail clearly if no PCHIDs were resolved
+      ansible.builtin.fail:
+        msg: |
+          Got {{ all_adapters.adapters | length }} adapter(s), none with an
+          adapter-id / adapter_id property. Likely full_properties wasn't
+          honored or the HMC user lacks 'View Adapter Properties'.
+      when: adapter_by_pchid | length == 0
+
+    - name: Pre-validate every PCHID across every partition (early abort)
+      ansible.builtin.assert:
+        that: pair.1.pchid in adapter_by_pchid
+        fail_msg: >
+          Partition '{{ pair.0.name }}' references PCHID {{ pair.1.pchid }}
+          (NIC '{{ pair.1.name }}') which does NOT exist in CPC {{ cpc_name }}.
+          Aborting before we change anything.
+          Available PCHIDs: {{ adapter_by_pchid.keys() | list | sort }}
+        quiet: true
+      loop: "{{ partitions | subelements('network_adapters') }}"
+      loop_control:
+        loop_var: pair
+        label: "{{ pair.0.name }} → {{ pair.1.name }} (PCHID {{ pair.1.pchid }})"
+
+    # -------------------------------------------------------------------------
+    # FAN OUT — one host per partition, all backed by localhost.
+    # We carry the shared facts (adapter_by_pchid, hmc_auth, cpc_name…) onto
+    # each pseudo-host so PLAY 2 doesn't have to re-discover anything.
+    # -------------------------------------------------------------------------
+    - name: Add each partition as its own pseudo-host
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: lpars_to_provision
+        ansible_connection: local
+        # Use the same python that already worked for localhost in PLAY 1.
+        # If we used ansible_playbook_python here we'd land on the python
+        # that ran ansible-playbook itself, which often differs from the
+        # interpreter ansible auto-discovered for localhost — and zhmcclient
+        # is only installed in one of them. Symptom: ModuleNotFoundError:
+        # No module named 'zhmcclient' at "Create / update partition".
+        ansible_python_interpreter: "{{ zhmc_python_interpreter }}"
+        partition_spec: "{{ item }}"
+        adapter_by_pchid: "{{ adapter_by_pchid }}"
+        cpc_name: "{{ cpc_name }}"
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        fail_fast: "{{ fail_fast | default(true) }}"
+      loop: "{{ partitions }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+# -----------------------------------------------------------------------------
+# PLAY 2 — provision in parallel
+#
+# strategy: free  → don't make hosts wait for each other at task boundaries
+# Effective parallelism is capped by --forks on the command line (default 5;
+# set to e.g. 8 for the typical HMC-friendly batch size).
+# -----------------------------------------------------------------------------
+- name: "Provision partitions in parallel"
+  hosts: lpars_to_provision
+  gather_facts: false
+  strategy: free
+  any_errors_fatal: false
+  tasks:
+
+    - name: "Provision {{ inventory_hostname }}"
+      ansible.builtin.include_tasks: tasks/provision-one-partition.yml
+      vars:
+        p: "{{ partition_spec }}"
+
+# -----------------------------------------------------------------------------
+# PLAY 3 — consolidate, report, exit code
+# -----------------------------------------------------------------------------
+- name: "Consolidate results and write reports"
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/connection.yml
+    - vars/partitions.yml
+
+  tasks:
+
+    - name: Pull each partition's outcome out of hostvars
+      ansible.builtin.set_fact:
+        provisioning_results: >-
+          {{ groups['lpars_to_provision']
+             | default([])
+             | map('extract', hostvars, 'this_result')
+             | select('defined')
+             | list }}
+
+    - name: Identify hosts that died before producing a this_result
+      ansible.builtin.set_fact:
+        _hosts_without_result: >-
+          {{ (groups['lpars_to_provision'] | default([]))
+             | difference(provisioning_results | map(attribute='name') | list) }}
+
+    - name: Synthesize FAILED entries for hosts with no this_result
+      ansible.builtin.set_fact:
+        provisioning_results: >-
+          {{ provisioning_results + [{
+                'name':   item,
+                'status': 'FAILED',
+                'error':  'no this_result was set — host likely died inside an unhandled task; see play log'
+             }] }}
+      loop: "{{ _hosts_without_result }}"
+      when: _hosts_without_result | length > 0
+
+    - name: Console summary
+      ansible.builtin.debug:
+        msg: |
+          ================================================================
+          MULTI-LPAR PROVISIONING SUMMARY  ({{ provisioning_results | length }} partition(s))
+          CPC: {{ cpc_name }}    HMC: {{ hmc_host }}
+          Mode: parallel (forks={{ ansible_forks | default('?') }})
+          ================================================================
+          {% for r in provisioning_results %}
+          {{ r.status }}  —  {{ r.name }}{% if r.status == 'OK' %}
+              IFLs / Memory  : {{ r.ifls }} IFL  /  {{ r.memory_mb }} MB
+              Storage group  : {{ r.storage_group }}  ({{ r.connectivity }} paths)
+              Boot volume    : {{ r.boot_volume }}
+              Data volumes   : {{ r.data_volumes | join(', ') }}
+              NICs           : {{ r.nics | join(', ') }}
+              PCHIDs         : {{ r.pchids | join(', ') }}
+              WWPNs          : {{ r.wwpns | join(', ') }}
+              Duration       : {{ r.duration_s | default('n/a') }} s{% else %}
+              ERROR          : {{ r.error | default('see play output') }}{% endif %}
+          {% endfor %}
+          ================================================================
+
+    - name: Write consolidated provisioning report (text — for the SAN ticket)
+      ansible.builtin.copy:
+        dest: "./provisioning-report.txt"
+        mode: "0644"
+        content: |
+          # ============================================================
+          # LinuxONE multi-LPAR provisioning report (parallel run)
+          # CPC : {{ cpc_name }}
+          # HMC : {{ hmc_host }}
+          # Generated : {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+          # Total partitions : {{ provisioning_results | length }}
+          # Successes        : {{ provisioning_results | selectattr('status','equalto','OK') | list | length }}
+          # Failures         : {{ provisioning_results | selectattr('status','equalto','FAILED') | list | length }}
+          # ============================================================
+
+          {% for r in provisioning_results %}
+          [{{ r.name }}]
+          status         = {{ r.status }}
+          {% if r.status == 'OK' %}
+          description    = {{ r.description | default('') }}
+          ifls           = {{ r.ifls }}
+          memory_mb      = {{ r.memory_mb }}
+          storage_group  = {{ r.storage_group }}
+          connectivity   = {{ r.connectivity }}
+          boot_volume    = {{ r.boot_volume }}
+          data_volumes   = {{ r.data_volumes | join(', ') }}
+          nics           = {{ r.nics | join(', ') }}
+          pchids         = {{ r.pchids | join(', ') }}
+          duration_s     = {{ r.duration_s | default('n/a') }}
+          {% for w in r.wwpns %}
+          wwpn_{{ loop.index }}         = {{ w }}
+          {% endfor %}
+          {% else %}
+          error          = {{ r.error | default('see playbook output') }}
+          {% endif %}
+
+          {% endfor %}
+          # ============================================================
+          # SAN ZONING — give this whole list to your storage admin:
+          # ============================================================
+          {% for r in provisioning_results | selectattr('status','equalto','OK') %}
+          # {{ r.name }} ({{ r.storage_group }}):
+          {% for w in r.wwpns %}
+              {{ w }}
+          {% endfor %}
+          {% endfor %}
+
+    - name: Write consolidated provisioning report (JSON — for tooling / CMDB)
+      ansible.builtin.copy:
+        dest: "./provisioning-report.json"
+        mode: "0644"
+        content: "{{ {
+            'cpc':           cpc_name,
+            'hmc':           hmc_host,
+            'generated_utc': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+            'total':         provisioning_results | length,
+            'successes':     provisioning_results | selectattr('status','equalto','OK') | list | length,
+            'failures':      provisioning_results | selectattr('status','equalto','FAILED') | list | length,
+            'partitions':    provisioning_results
+          } | to_nice_json }}\n"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: |
+          Wrote ./provisioning-report.txt  (human / SAN-ticket format)
+                ./provisioning-report.json (machine readable)
+
+    - name: Hard-fail at end if ANY partition failed
+      ansible.builtin.fail:
+        msg: >
+          {{ provisioning_results | selectattr('status','equalto','FAILED') | list | length }}
+          partition(s) failed. See provisioning-report.txt for details.
+      when:
+        - provisioning_results | selectattr('status','equalto','FAILED') | list | length > 0

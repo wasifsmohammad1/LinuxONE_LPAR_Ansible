@@ -1,0 +1,36 @@
+---
+# =============================================================================
+# provision-lpars.yml is now a thin redirect to provision-lpars-parallel.yml.
+#
+# The previous version of this file tried to parallelize a per-partition
+# include with `async + poll: 0`, which Ansible rejects:
+#     ERROR! 'poll' is not a valid attribute for a TaskInclude
+# (async/poll only works on real module tasks, not on include_tasks). It also
+# couldn't surface set_fact results out of the async wrapper, so the
+# consolidated report came out empty.
+#
+# The fixed playbook (provision-lpars-parallel.yml) does true parallel
+# provisioning via the canonical Ansible add_host fan-out + strategy: free
+# pattern, then a third play consolidates the per-host results into the
+# text + JSON report. To preserve existing muscle memory, this filename
+# now imports it.
+#
+# Run either of:
+#     ansible-playbook -i inventory.yml provision-lpars.yml          --ask-vault-pass --forks 8
+#     ansible-playbook -i inventory.yml provision-lpars-parallel.yml --ask-vault-pass --forks 8
+# =============================================================================
+
+- name: "Notice — redirecting provision-lpars.yml → provision-lpars-parallel.yml"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Tell the user
+      ansible.builtin.debug:
+        msg: |
+          provision-lpars.yml is now a redirect.
+          Importing provision-lpars-parallel.yml — same vars/partitions.yml,
+          true parallel execution capped by --forks (currently:
+          {{ ansible_forks | default('default 5') }}), and the consolidated
+          report writes to ./provisioning-report.txt and ./provisioning-report.json.
+
+- import_playbook: provision-lpars-parallel.yml

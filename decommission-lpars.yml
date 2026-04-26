@@ -1,0 +1,112 @@
+---
+# =============================================================================
+# Tear down partitions listed in vars/partitions.yml.
+#
+# Two modes, controlled by `delete_storage_group` (default: true):
+#
+#   delete_storage_group=true  (DEFAULT)
+#       Stop partition → detach SG → DELETE SG (and all its volumes) → delete partition.
+#       This is the full-teardown / clean-slate mode.
+#
+#   delete_storage_group=false
+#       Stop partition → detach SG → KEEP SG and volumes → delete partition.
+#       Use when you want to recycle the storage (e.g. rebuild the partition
+#       and re-attach the same SG, hand the SG to a different partition, or
+#       hold the data while the partition is being reworked).
+#
+# Examples
+# --------
+#   # full teardown of every partition
+#   ansible-playbook -i inventory.yml decommission-lpars.yml --ask-vault-pass
+#
+#   # full teardown of a specific subset
+#   ansible-playbook -i inventory.yml decommission-lpars.yml --ask-vault-pass \
+#       -e "only=l1testw1,l1testw2"
+#
+#   # delete the partition but KEEP the storage group + volumes
+#   ansible-playbook -i inventory.yml decommission-lpars.yml --ask-vault-pass \
+#       -e "delete_storage_group=false"
+#
+#   # subset + keep storage
+#   ansible-playbook -i inventory.yml decommission-lpars.yml --ask-vault-pass \
+#       -e "only=l1testw3 delete_storage_group=false"
+# =============================================================================
+
+- name: Decommission multiple LinuxONE partitions
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/connection.yml
+    - vars/partitions.yml
+
+  vars:
+    only: ""                                 # CSV of partition names; empty = all
+    delete_storage_group: true               # set false to keep SG + volumes
+    # ibm.ibm_zhmc 1.10 uses `verify` (verify_cert is the 1.11+ name).
+    # Keep in sync with provision-lpars.yml / provision-lpars-parallel.yml.
+    hmc_auth:
+      userid: "{{ hmc_userid }}"
+      password: "{{ hmc_password }}"
+      verify: "{{ hmc_verify }}"
+
+  tasks:
+
+    - name: "Filter partitions by --only=<csv> (default: all)"
+      ansible.builtin.set_fact:
+        partitions_to_destroy: >-
+          {{ partitions if (only | length == 0)
+             else (partitions | selectattr('name', 'in', only.split(',')) | list) }}
+
+    - name: "Bail if --only didn't match anything"
+      ansible.builtin.fail:
+        msg: >
+          --only="{{ only }}" matched zero partitions in vars/partitions.yml.
+          Available names: {{ partitions | map(attribute='name') | list }}
+      when:
+        - only | length > 0
+        - partitions_to_destroy | length == 0
+
+    - name: Confirm intent (Ctrl-C now if this wasn't deliberate)
+      ansible.builtin.pause:
+        prompt: |
+          ================================================================
+          DECOMMISSION  —  {{ partitions_to_destroy | length }} partition(s)
+          CPC: {{ cpc_name }}    HMC: {{ hmc_host }}
+          delete_storage_group = {{ delete_storage_group | bool }}
+          ================================================================
+          {% for p in partitions_to_destroy %}
+            - {{ p.name }}   (storage group: {{ p.storage.group_name }})
+          {% endfor %}
+
+          {% if delete_storage_group | bool %}
+          This will:
+              * stop each partition
+              * detach its storage group
+              * DELETE the storage group AND ALL VOLUMES INSIDE IT
+              * delete the partition
+          {% else %}
+          This will:
+              * stop each partition
+              * detach its storage group from the partition
+              * KEEP the storage group and ALL its volumes intact
+                (they'll be unattached, ready to re-use)
+              * delete the partition
+          {% endif %}
+
+          Press ENTER to continue, Ctrl-C then 'a' to abort.
+
+    - name: Destroy each partition
+      ansible.builtin.include_tasks: tasks/delete-partition.yml
+      vars:
+        p: "{{ this_partition }}"
+      loop: "{{ partitions_to_destroy }}"
+      loop_control:
+        loop_var: this_partition
+        label: "{{ this_partition.name }}  (delete_sg={{ delete_storage_group | bool }})"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: |
+          Decommissioned {{ partitions_to_destroy | length }} partition(s).
+          Storage groups {{ 'and their volumes were DELETED' if (delete_storage_group | bool) else 'were KEPT (detached, intact)' }}.

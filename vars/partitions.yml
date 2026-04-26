@@ -1,0 +1,171 @@
+---
+# =============================================================================
+# Multiple-LPAR specification.
+#
+# Add / remove / reorder entries here — the main playbook iterates over this
+# list and provisions each partition end-to-end (partition → NICs → SG → boot
+# volume → data volumes → attach → readback WWPNs).
+#
+# Each entry is fully self-contained — different partitions can have totally
+# different sizes, PCHID lists, and storage layouts.
+# =============================================================================
+
+# Stop on first failure?  Set to false to keep going on the remaining
+# partitions if one fails (useful for batch ops where a single bad PCHID
+# shouldn't block the rest).
+fail_fast: true
+
+# How many seconds to pause between partition creates (gives HMC API time to
+# settle so back-to-back creates don't trip the rate limiter).
+inter_partition_pause: 5
+
+partitions:
+
+  # ---------------------------------------------------------------------------
+  # 1) Production application partition — high IFL/RAM, dual-FCP-path storage
+  # ---------------------------------------------------------------------------
+  - name: l1testw1 
+    description: "l1testw1"
+    type: linux
+    processor_mode: shared
+    ifl_processors: 1
+    initial_memory: 4096
+    maximum_memory: 32768
+    autostart: false
+
+    # device_number is the 4-hex-char subchannel address inside the partition.
+    # Must be unique PER PARTITION (each partition has its own subchannel
+    # space, so the same number can repeat across partitions).
+    #   mgmt-bond1-port1 -> 0600   data-bond2-port1 -> 0100
+    #   mgmt-bond1-port2 -> 0700   data-bond2-port2 -> 0200
+    # Inside Linux these will surface as /sys/bus/ccw/devices/0.0.0600 etc.
+    network_adapters:
+      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0600", description: "mgmt-bond1-port1" }
+      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0700", description: "mgmt-bond1-port2" }
+      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0100", description: "data-bond2-port1" }
+      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0200", description: "data-bond2-port2" }
+
+    storage:
+      group_name:        "l1testw1-OS"
+      group_description: "FCP SG for l1testw1-OS"
+      connectivity:      4                  # 2 WWPNs (multipath)
+      max_partitions:    1
+      boot_volume:
+        name:        "vol-boot-l1testw1-KVM"
+        description: "Boot disk"
+        size:        300                     # GB
+      data_volumes:
+        - { name: "vol-libvirt01-01", size: 120, description: "kvm-libvirt" }
+        - { name: "vol-vgextra01-02", size: 120, description: "kvm-vgextra" }
+
+  # ---------------------------------------------------------------------------
+  # 2) l1testw2 — clone of l1testw1 with its own SG + volume names so the
+  #    parallel run actually has more than one host to fan out to.
+  # ---------------------------------------------------------------------------
+  - name: l1testw2
+    description: "l1testw2"
+    type: linux
+    processor_mode: shared
+    ifl_processors: 1
+    initial_memory: 4096
+    maximum_memory: 32768
+    autostart: false
+
+    # device_number is the 4-hex-char subchannel address inside the partition.
+    # Must be unique PER PARTITION (each partition has its own subchannel
+    # space, so the same number can repeat across partitions).
+    #   mgmt-bond1-port1 -> 0600   data-bond2-port1 -> 0100
+    #   mgmt-bond1-port2 -> 0700   data-bond2-port2 -> 0200
+    # Inside Linux these will surface as /sys/bus/ccw/devices/0.0.0600 etc.
+    network_adapters:
+      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0600", description: "mgmt-bond1-port1" }
+      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0700", description: "mgmt-bond1-port2" }
+      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0100", description: "data-bond2-port1" }
+      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0200", description: "data-bond2-port2" }
+
+    storage:
+      group_name:        "l1testw2-OS"
+      group_description: "FCP SG for l1testw2-OS"
+      connectivity:      4
+      max_partitions:    1
+      boot_volume:
+        name:        "vol-boot-l1testw2-KVM"
+        description: "Boot disk"
+        size:        300
+      data_volumes:
+        - { name: "vol-libvirt02-01", size: 120, description: "kvm-libvirt" }
+        - { name: "vol-vgextra02-02", size: 120, description: "kvm-vgextra" }
+
+  # ---------------------------------------------------------------------------
+  # 3) l1testw3
+  # ---------------------------------------------------------------------------
+  - name: l1testw3
+    description: "l1testw3"
+    type: linux
+    processor_mode: shared
+    ifl_processors: 1
+    initial_memory: 4096
+    maximum_memory: 32768
+    autostart: false
+
+    # device_number is the 4-hex-char subchannel address inside the partition.
+    # Must be unique PER PARTITION (each partition has its own subchannel
+    # space, so the same number can repeat across partitions).
+    #   mgmt-bond1-port1 -> 0600   data-bond2-port1 -> 0100
+    #   mgmt-bond1-port2 -> 0700   data-bond2-port2 -> 0200
+    # Inside Linux these will surface as /sys/bus/ccw/devices/0.0.0600 etc.
+    network_adapters:
+      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0600", description: "mgmt-bond1-port1" }
+      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0700", description: "mgmt-bond1-port2" }
+      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0100", description: "data-bond2-port1" }
+      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0200", description: "data-bond2-port2" }
+
+    storage:
+      group_name:        "l1testw3-OS"
+      group_description: "FCP SG for l1testw3-OS"
+      connectivity:      4
+      max_partitions:    1
+      boot_volume:
+        name:        "vol-boot-l1testw3-KVM"
+        description: "Boot disk"
+        size:        300
+      data_volumes:
+        - { name: "vol-libvirt03-01", size: 120, description: "kvm-libvirt" }
+        - { name: "vol-vgextra03-02", size: 120, description: "kvm-vgextra" }
+
+  # ---------------------------------------------------------------------------
+  # 4) l1testw4
+  # ---------------------------------------------------------------------------
+  - name: l1testw4
+    description: "l1testw4"
+    type: linux
+    processor_mode: shared
+    ifl_processors: 1
+    initial_memory: 4096
+    maximum_memory: 32768
+    autostart: false
+
+    # device_number is the 4-hex-char subchannel address inside the partition.
+    # Must be unique PER PARTITION (each partition has its own subchannel
+    # space, so the same number can repeat across partitions).
+    #   mgmt-bond1-port1 -> 0600   data-bond2-port1 -> 0100
+    #   mgmt-bond1-port2 -> 0700   data-bond2-port2 -> 0200
+    # Inside Linux these will surface as /sys/bus/ccw/devices/0.0.0600 etc.
+    network_adapters:
+      - { name: mgmt-bond1-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0600", description: "mgmt-bond1-port1" }
+      - { name: mgmt-bond1-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0700", description: "mgmt-bond1-port2" }
+      - { name: data-bond2-port1,  pchid: "10c", port: 1, vlan_id: "", device_number: "0100", description: "data-bond2-port1" }
+      - { name: data-bond2-port2,  pchid: "1ec", port: 1, vlan_id: "", device_number: "0200", description: "data-bond2-port2" }
+
+    storage:
+      group_name:        "l1testw4-OS"
+      group_description: "FCP SG for l1testw4-OS"
+      connectivity:      4
+      max_partitions:    1
+      boot_volume:
+        name:        "vol-boot-l1testw4-KVM"
+        description: "Boot disk"
+        size:        300
+      data_volumes:
+        - { name: "vol-libvirt04-01", size: 120, description: "kvm-libvirt" }
+        - { name: "vol-vgextra04-02", size: 120, description: "kvm-vgextra" }

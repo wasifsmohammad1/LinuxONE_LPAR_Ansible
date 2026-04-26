@@ -1,0 +1,57 @@
+---
+# =============================================================================
+# Per-partition teardown. Included from decommission-lpars.yml.
+# hmc_host + hmc_auth passed explicitly to each task (no module_defaults).
+#
+# Behavior is controlled by `delete_storage_group` (default: true):
+#   true  → stop partition, detach SG, DELETE SG (and its volumes), delete partition
+#   false → stop partition, detach SG, KEEP SG and volumes, delete partition
+#
+# The detach is always done — a partition can't be cleanly deleted while it
+# still has a storage-group attachment.
+# =============================================================================
+
+- name: "[{{ p.name }}] Stop the partition (if running)"
+  ibm.ibm_zhmc.zhmc_partition:
+    hmc_host: "{{ hmc_host }}"
+    hmc_auth: "{{ hmc_auth }}"
+    cpc_name: "{{ cpc_name }}"
+    name: "{{ p.name }}"
+    state: stopped
+  ignore_errors: true
+
+- name: "[{{ p.name }}] Detach storage group from partition"
+  ibm.ibm_zhmc.zhmc_storage_group_attachment:
+    hmc_host: "{{ hmc_host }}"
+    hmc_auth: "{{ hmc_auth }}"
+    cpc_name: "{{ cpc_name }}"
+    storage_group_name: "{{ p.storage.group_name }}"
+    partition_name: "{{ p.name }}"
+    state: detached
+  ignore_errors: true
+
+- name: "[{{ p.name }}] Delete storage group (and all volumes)"
+  ibm.ibm_zhmc.zhmc_storage_group:
+    hmc_host: "{{ hmc_host }}"
+    hmc_auth: "{{ hmc_auth }}"
+    cpc_name: "{{ cpc_name }}"
+    name: "{{ p.storage.group_name }}"
+    state: absent
+  when: delete_storage_group | default(true) | bool
+  ignore_errors: true
+
+- name: "[{{ p.name }}] KEEP storage group {{ p.storage.group_name }} (delete_storage_group=false)"
+  ansible.builtin.debug:
+    msg: >
+      Skipping deletion of storage group '{{ p.storage.group_name }}' and its
+      volumes. The SG is now detached from {{ p.name }} and is available to be
+      reattached to another partition (or to the same one when re-provisioned).
+  when: not (delete_storage_group | default(true) | bool)
+
+- name: "[{{ p.name }}] Delete partition"
+  ibm.ibm_zhmc.zhmc_partition:
+    hmc_host: "{{ hmc_host }}"
+    hmc_auth: "{{ hmc_auth }}"
+    cpc_name: "{{ cpc_name }}"
+    name: "{{ p.name }}"
+    state: absent

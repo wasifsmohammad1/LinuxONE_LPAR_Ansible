@@ -1,0 +1,34 @@
+# ============================================================
+# LinuxONE multi-LPAR provisioning report
+# CPC : P00BF028
+# HMC : 10.200.81.139
+# Generated : 2026-04-26T17:24:44Z
+# Total partitions processed : 1
+# Successes : 1
+# Failures  : 0
+# ============================================================
+
+[l1testw1]
+status         = OK
+description    = l1testw1
+ifls           = 1
+memory_mb      = 4096
+storage_group  = l1testw1-OS
+connectivity   = 4
+boot_volume    = vol-boot-l1testw1-KVM
+data_volumes   = vol-libvirt01-01, vol-vgextra01-02
+nics           = mgmt-bond1-port1, mgmt-bond1-port2, data-bond2-port1, data-bond2-port2
+pchids         = 10c, 1ec, 10c, 1ec
+wwpn_1         = c05076c40e000463
+wwpn_2         = c05076c40e000462
+wwpn_3         = c05076c40e000466
+wwpn_4         = c05076c40e000465
+
+# ============================================================
+# SAN ZONING — give this whole list to your storage admin:
+# ============================================================
+# l1testw1 (l1testw1-OS):
+    c05076c40e000463
+    c05076c40e000462
+    c05076c40e000466
+    c05076c40e000465

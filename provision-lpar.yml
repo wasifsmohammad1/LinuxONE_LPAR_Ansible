@@ -1,0 +1,23 @@
+---
+# =============================================================================
+# DEPRECATED — single-LPAR version. Superseded by provision-lpars.yml which
+# can do one OR many partitions in a single run via vars/partitions.yml.
+#
+# This file is kept only as a redirect; running it just prints the message
+# and exits. Use:
+#     ansible-playbook -i inventory.yml provision-lpars.yml --ask-vault-pass
+# =============================================================================
+- name: DEPRECATED — use provision-lpars.yml instead
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Tell the user where to go
+      ansible.builtin.fail:
+        msg: |
+          provision-lpar.yml has been replaced by provision-lpars.yml.
+          The new playbook supports one OR many partitions and reads its
+          spec from vars/partitions.yml. Run:
+
+              ansible-playbook -i inventory.yml provision-lpars.yml --ask-vault-pass
+
+          See README.md for details.
