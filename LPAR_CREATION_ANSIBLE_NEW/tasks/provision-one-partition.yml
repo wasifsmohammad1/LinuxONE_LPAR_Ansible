@@ -1,0 +1,303 @@
+---
+# =============================================================================
+# Per-partition provisioning — PARALLEL-SAFE version.
+#
+# Included from provision-lpars-parallel.yml inside PLAY 2, where each
+# partition is its own pseudo-host. That means:
+#   * `set_fact` here is per-host — no accumulator clobbering between partitions
+#   * the `block / rescue` always lives in this host's own context
+#   * the consolidator (PLAY 3) reads `this_result` out of hostvars[<name>]
+#
+# Variables expected:
+#   p                  — the partition spec (one entry from vars/partitions.yml)
+#   adapter_by_pchid   — PCHID → adapter object (resolved once in PLAY 1)
+#   cpc_name, hmc_host, hmc_auth — pushed onto the host by add_host
+#   fail_fast          — if true, the rescue re-raises so PLAY 2 stops this host
+# =============================================================================
+
+- name: "[{{ p.name }}] Provision"
+  block:
+
+    - name: "[{{ p.name }}] Record start time"
+      ansible.builtin.set_fact:
+        _start_epoch: "{{ ansible_date_time.epoch | default(lookup('pipe', 'date +%s')) }}"
+
+    # -------------------------------------------------------------------------
+    # 1) Partition (stopped) — IFL-only, LinuxONE
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Validate IFL count"
+      ansible.builtin.assert:
+        that: (p.ifl_processors | default(0) | int) > 0
+        fail_msg: >
+          Partition '{{ p.name }}' must specify ifl_processors > 0.
+          LinuxONE partitions cannot use CP engines — only IFLs.
+
+    - name: "[{{ p.name }}] Create / update partition"
+      ibm.ibm_zhmc.zhmc_partition:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ p.name }}"
+        state: stopped
+        properties:
+          description:    "{{ p.description }}"
+          type:           "{{ p.type | default('linux') }}"
+          processor_mode: "{{ p.processor_mode | default('shared') }}"
+          ifl_processors: "{{ p.ifl_processors | int }}"
+          initial_memory: "{{ p.initial_memory }}"
+          maximum_memory: "{{ p.maximum_memory | default(p.initial_memory) }}"
+
+    # -------------------------------------------------------------------------
+    # 2) Validate every PCHID in this partition's NIC list
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Assert every requested PCHID exists in CPC"
+      ansible.builtin.assert:
+        that: item.pchid in adapter_by_pchid
+        fail_msg: >
+          [{{ p.name }}] PCHID {{ item.pchid }} (NIC '{{ item.name }}')
+          NOT FOUND in CPC {{ cpc_name }}.
+          Available PCHIDs: {{ adapter_by_pchid.keys() | list | sort }}
+        quiet: true
+      loop: "{{ p.network_adapters }}"
+      loop_control:
+        label: "{{ item.name }} (PCHID {{ item.pchid }})"
+
+    # -------------------------------------------------------------------------
+    # 3) Resolve adapter port URI for each NIC.
+    #    `nics_for_partition` is a host-local fact — safe under parallel runs
+    #    because each pseudo-host has its own fact namespace.
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Initialize per-host NIC accumulator"
+      ansible.builtin.set_fact:
+        nics_for_partition: []
+
+    - name: "[{{ p.name }}] Resolve adapter port URIs"
+      ansible.builtin.set_fact:
+        nics_for_partition: >-
+          {{ nics_for_partition + [
+                item | combine({
+                  'adapter_uri':  ad['object-uri']
+                                    | default(ad['object_uri']
+                                    | default(ad['uri'])),
+                  'adapter_name': ad['name'],
+                  'port_uri':     (ad['network-port-uris']
+                                    | default(ad['network_port_uris']
+                                    | default(ad['port-uris']
+                                    | default([]))))[item.port | default(0)]
+                })
+             ] }}
+      loop: "{{ p.network_adapters }}"
+      vars:
+        ad: "{{ adapter_by_pchid[item.pchid] }}"
+      loop_control:
+        label: "{{ item.name }} (PCHID {{ item.pchid }})"
+
+    # -------------------------------------------------------------------------
+    # 4) Create NICs
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Create NIC"
+      ibm.ibm_zhmc.zhmc_nic:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        partition_name: "{{ p.name }}"
+        name: "{{ item.name }}"
+        state: present
+        properties:
+          adapter_name:  "{{ item.adapter_name }}"
+          adapter_port:  "{{ item.port | default(0) }}"
+          description:   "{{ item.description }} (PCHID {{ item.pchid }})"
+          device-number: "{{ item.device_number | default(omit) }}"
+      loop: "{{ nics_for_partition }}"
+      loop_control:
+        label: "{{ item.name }} on {{ item.adapter_name }} port {{ item.port | default(0) }}"
+
+    # -------------------------------------------------------------------------
+    # 5) FCP storage group
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Create FCP storage group"
+      ibm.ibm_zhmc.zhmc_storage_group:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ p.storage.group_name }}"
+        state: present
+        properties:
+          description:    "{{ p.storage.group_description | default(p.storage.group_name) }}"
+          type:           "fcp"
+          shared:         false
+          connectivity:   "{{ p.storage.connectivity   | default(2) }}"
+          # Honor the per-partition value if set (was hard-coded to 1 before).
+          max-partitions: "{{ p.storage.max_partitions | default(1) }}"
+      register: sg_create_result
+
+    - name: "[{{ p.name }}] Wait for HMC to commit the new SG"
+      ansible.builtin.pause:
+        seconds: 10
+      when: sg_create_result.changed | default(false) | bool
+
+    # -------------------------------------------------------------------------
+    # 6) Volumes (boot + data) with retries for HMC eventual consistency
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Create boot volume"
+      ibm.ibm_zhmc.zhmc_storage_volume:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        storage_group_name: "{{ p.storage.group_name }}"
+        name: "{{ p.storage.boot_volume.name }}"
+        state: present
+        properties:
+          description: "{{ p.storage.boot_volume.description | default('Boot disk') }}"
+          size:        "{{ p.storage.boot_volume.size }}"
+          usage:       "boot"
+      register: boot_vol_result
+      retries: 6
+      delay: 5
+      until: boot_vol_result is succeeded
+
+    - name: "[{{ p.name }}] Create data volumes"
+      ibm.ibm_zhmc.zhmc_storage_volume:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        storage_group_name: "{{ p.storage.group_name }}"
+        name: "{{ item.name }}"
+        state: present
+        properties:
+          description: "{{ item.description | default(item.name) }}"
+          size:        "{{ item.size }}"
+          usage:       "data"
+      loop: "{{ p.storage.data_volumes | default([]) }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.size }} GB)"
+      register: data_vol_result
+      retries: 6
+      delay: 5
+      until: data_vol_result is succeeded
+
+    # -------------------------------------------------------------------------
+    # 7) Attach SG to partition (creates VSRs and assigns WWPNs)
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Attach storage group → partition"
+      ibm.ibm_zhmc.zhmc_storage_group_attachment:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        storage_group_name: "{{ p.storage.group_name }}"
+        partition_name: "{{ p.name }}"
+        state: attached
+      register: sg_attach_result
+      retries: 6
+      delay: 5
+      until: sg_attach_result is succeeded
+
+    - name: "[{{ p.name }}] Wait for HMC to mint VSRs/WWPNs after attach"
+      ansible.builtin.pause:
+        seconds: 30
+      when: sg_attach_result.changed | default(false) | bool
+
+    # -------------------------------------------------------------------------
+    # 8) Boot device
+    #    Default: keep current behavior (boot_device: none) so we don't
+    #    surprise existing operators. Set p.set_boot_from_volume: true in
+    #    vars/partitions.yml when you actually want the partition to IPL
+    #    from the boot volume on start.
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Set partition boot device (none — manual IPL)"
+      ibm.ibm_zhmc.zhmc_partition:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ p.name }}"
+        state: stopped
+        properties:
+          boot_device: "none"
+      when: not (p.set_boot_from_volume | default(false) | bool)
+
+    - name: "[{{ p.name }}] Set partition boot device → boot volume in SG"
+      ibm.ibm_zhmc.zhmc_partition:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ p.name }}"
+        state: stopped
+        properties:
+          boot_device:              "storage-volume"
+          boot_storage_group_name:  "{{ p.storage.group_name }}"
+          boot_storage_volume_name: "{{ p.storage.boot_volume.name }}"
+      when: p.set_boot_from_volume | default(false) | bool
+
+    # -------------------------------------------------------------------------
+    # 9) Read back WWPNs
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Fetch storage group WWPNs"
+      ibm.ibm_zhmc.zhmc_storage_group:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ p.storage.group_name }}"
+        state: facts
+        expand: true
+      register: sg_facts
+      retries: 10
+      delay: 15
+
+    - name: "[{{ p.name }}] Extract WWPNs"
+      ansible.builtin.set_fact:
+        this_wwpns: >-
+          {{
+            sg_facts.storage_group['virtual-storage-resources']
+            | default([])
+            | selectattr('world-wide-port-name', 'defined')
+            | map(attribute='world-wide-port-name')
+            | list
+          }}
+
+    - name: "[{{ p.name }}] Save per-host result (the report reads this)"
+      ansible.builtin.set_fact:
+        this_result:
+          name:          "{{ p.name }}"
+          description:   "{{ p.description | default('') }}"
+          ifls:          "{{ p.ifl_processors | default(0) }}"
+          memory_mb:     "{{ p.initial_memory }}"
+          storage_group: "{{ p.storage.group_name }}"
+          connectivity: "{{ p.storage.connectivity | default(2) }}"
+          boot_volume:   "{{ p.storage.boot_volume.name }}"
+          data_volumes:  "{{ p.storage.data_volumes | default([]) | map(attribute='name') | list }}"
+          nics:          "{{ p.network_adapters | map(attribute='name') | list }}"
+          pchids:        "{{ p.network_adapters | map(attribute='pchid') | list }}"
+          wwpns:         "{{ this_wwpns }}"
+          status:        "OK"
+          duration_s:    "{{ ((lookup('pipe','date +%s') | int) - (_start_epoch | int)) }}"
+
+    # -------------------------------------------------------------------------
+    # 10) Optional autostart
+    # -------------------------------------------------------------------------
+    - name: "[{{ p.name }}] Start partition (autostart=true)"
+      ibm.ibm_zhmc.zhmc_partition:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ p.name }}"
+        state: active
+      when: p.autostart | default(false) | bool
+
+  # ===========================================================================
+  # rescue — record the failure, then either swallow it (fail_fast=false) so
+  # the consolidator still runs, or re-raise so this host (only) is marked
+  # failed in PLAY 2.
+  # ===========================================================================
+  rescue:
+
+    - name: "[{{ p.name }}] FAILED — record outcome for the report"
+      ansible.builtin.set_fact:
+        this_result:
+          name:   "{{ p.name }}"
+          status: "FAILED"
+          error:  "{{ ansible_failed_result.msg | default(ansible_failed_task.name | default('see prior task output')) }}"
+
+    - name: "[{{ p.name }}] Re-raise (fail_fast=true) so this host is marked failed"
+      ansible.builtin.fail:
+        msg: "fail_fast=true and {{ p.name }} failed: {{ this_result.error }}"
+      when: fail_fast | default(true) | bool

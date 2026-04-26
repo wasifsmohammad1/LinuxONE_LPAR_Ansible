@@ -20,10 +20,12 @@
     only: ""                                 # CSV of names; empty = all
     # No module_defaults group (incompatible with ibm.ibm_zhmc 1.8 + ansible 2.14).
     # We pass hmc_auth explicitly in each per-partition delete task instead.
+    # ibm.ibm_zhmc 1.10 uses `verify` (verify_cert is the 1.11+ name).
+    # Keep this in sync with provision-lpars.yml / provision-lpars-parallel.yml.
     hmc_auth:
       userid: "{{ hmc_userid }}"
       password: "{{ hmc_password }}"
-      verify_cert: "{{ hmc_verify }}"
+      verify: "{{ hmc_verify }}"
 
   tasks:
 
