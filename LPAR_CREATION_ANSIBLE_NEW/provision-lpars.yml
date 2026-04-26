@@ -27,7 +27,7 @@
 - name: Provision multiple LinuxONE partitions
   hosts: localhost
   gather_facts: false
-
+  
   vars_files:
     - vars/connection.yml
       #    - vars/vault.yml          # holds vault_hmc_password (encrypted)
@@ -161,11 +161,7 @@
     # =========================================================================
     # PHASE C — Loop over partitions, run the per-partition tasks file
     # =========================================================================
-    - name: Initialize the run-wide results collector
-      ansible.builtin.set_fact:
-        provisioning_results: []
-
-    - name: "Provision each partition"
+    - name: "Provision each partition (parallel)"
       ansible.builtin.include_tasks: tasks/create-partition.yml
       vars:
         p: "{{ this_partition }}"
@@ -173,6 +169,27 @@
       loop_control:
         loop_var: this_partition
         label: "{{ this_partition.name }}"
+      async: 1800
+      poll: 0
+      register: async_jobs
+
+    - name: Wait for all partitions to complete
+      async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: job_results
+      until: job_results.finished
+      retries: 100
+      delay: 20
+      loop: "{{ async_jobs.results }}"
+
+    - name: Build provisioning_results
+      set_fact:
+        provisioning_results: >-
+          {{
+            job_results.results
+            | map(attribute='ansible_facts.this_result')
+            | list
+          }}
 
     # =========================================================================
     # PHASE D — Consolidated summary + single report file for SAN team
