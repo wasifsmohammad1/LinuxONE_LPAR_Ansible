@@ -1,0 +1,304 @@
+---
+# =============================================================================
+# Provision STANDALONE storage groups (parallel) — defined in
+# vars/storage_groups.yml, attached to existing partitions.
+#
+# This playbook is fully decoupled from vars/partitions.yml. Use it to:
+#   * add brand-new storage groups (e.g. an extra data SG) to existing
+#     partitions without touching the partition spec
+#   * attach multiple SGs to the same partition (each entry in
+#     vars/storage_groups.yml is independent)
+#   * roll out a batch of SGs across many partitions in parallel
+#
+# For each SG in vars/storage_groups.yml, in parallel:
+#   1. Verify the target partition exists.
+#   2. Create the FCP storage group.
+#   3. Create the optional boot volume.
+#   4. Create the data volumes.
+#   5. Attach SG → partition.
+#   6. Update SG description (auto-generated unless vars set one explicitly).
+#   7. Read back WWPNs.
+#
+# Pattern (same as provision-lpars-parallel.yml / provision-storage-parallel.yml):
+#   PLAY 1 (localhost) — pre-flight + add_host fan-out
+#   PLAY 2 (sgs_to_provision)  strategy: free   forks: N
+#   PLAY 3 (localhost) — consolidate + write reports
+#
+# Run
+# ---
+#   ansible-playbook -i inventory.yml provision-storage-groups.yml \
+#       --ask-vault-pass --forks 4
+#
+#   # subset by SG name
+#   ansible-playbook -i inventory.yml provision-storage-groups.yml \
+#       --ask-vault-pass -e "only=l1testw1-data-extra-SG,l1testw2-db-SG"
+#
+#   # don't let one bad SG kill the rest
+#   ansible-playbook -i inventory.yml provision-storage-groups.yml \
+#       --ask-vault-pass -e fail_fast=false
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# PLAY 1 — pre-flight + fan-out
+# -----------------------------------------------------------------------------
+- name: "Pre-flight (CPC + DPM) and fan-out"
+  hosts: localhost
+  gather_facts: true
+
+  vars_files:
+    - vars/connection.yml
+    - vars/storage_groups.yml
+
+  vars:
+    only: ""                       # CSV of SG names; empty = all
+    hmc_auth:
+      userid: "{{ hmc_userid }}"
+      password: "{{ hmc_password }}"
+      verify: "{{ hmc_verify }}"
+
+  tasks:
+
+    - name: Capture python interpreter that has zhmcclient (= localhost's)
+      ansible.builtin.set_fact:
+        zhmc_python_interpreter: >-
+          {{ ansible_python.executable
+             | default(ansible_facts.discovered_interpreter_python
+             | default(ansible_playbook_python)) }}
+
+    - name: Show which interpreter the pseudo-hosts will use
+      ansible.builtin.debug:
+        msg: "Pseudo-hosts in PLAY 2 will use python: {{ zhmc_python_interpreter }}"
+
+    - name: PRE-FLIGHT — confirm the CPC exists and is in DPM mode
+      ibm.ibm_zhmc.zhmc_cpc:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        name: "{{ cpc_name }}"
+        state: facts
+      register: cpc_facts
+
+    - name: PRE-FLIGHT — assert CPC is DPM-enabled
+      ansible.builtin.assert:
+        that: cpc_facts.cpc['dpm-enabled'] | default(false) | bool
+        fail_msg: "CPC {{ cpc_name }} is in classic mode. This playbook requires DPM."
+
+    - name: "Filter SGs by --only=<csv> (default: all)"
+      ansible.builtin.set_fact:
+        sgs_to_provision: >-
+          {{ storage_groups if (only | length == 0)
+             else (storage_groups | selectattr('name', 'in', only.split(',')) | list) }}
+
+    - name: "Bail if --only didn't match anything"
+      ansible.builtin.fail:
+        msg: >
+          --only="{{ only }}" matched zero SGs. Available SG names:
+          {{ storage_groups | map(attribute='name') | list }}
+      when:
+        - only | length > 0
+        - sgs_to_provision | length == 0
+
+    - name: "Sanity-check every SG entry has the required keys"
+      ansible.builtin.assert:
+        that:
+          - item.name is defined and (item.name | length) > 0
+          - item.partition is defined and (item.partition | length) > 0
+          - (item.boot_volume is defined) or ((item.data_volumes | default([]) | length) > 0)
+        fail_msg: >
+          SG entry '{{ item.name | default('(unnamed)') }}' is malformed.
+          Required keys: name, partition, AND at least one of (boot_volume,
+          data_volumes). Got: {{ item }}
+        quiet: true
+      loop: "{{ sgs_to_provision }}"
+      loop_control:
+        label: "{{ item.name | default('(unnamed)') }}"
+
+    - name: "Reject duplicate SG names (must be unique per CPC)"
+      ansible.builtin.assert:
+        that: >
+          (sgs_to_provision | map(attribute='name') | list | length)
+          == (sgs_to_provision | map(attribute='name') | list | unique | list | length)
+        fail_msg: >
+          Duplicate SG name(s) in vars/storage_groups.yml. Names must be
+          unique per CPC. Names seen: {{ sgs_to_provision | map(attribute='name') | list }}
+
+    - name: PRE-FLIGHT — show what's about to happen
+      ansible.builtin.debug:
+        msg: |
+          About to provision {{ sgs_to_provision | length }} storage group(s) in parallel:
+          {% for s in sgs_to_provision %}
+            - {{ s.name }}  →  partition {{ s.partition }}
+              ({{ ((s.boot_volume.size | default(0)) | int)
+                  + (s.data_volumes | default([]) | map(attribute='size') | map('int') | sum) }} GB total,
+              {{ s.connectivity | default(2) }} paths)
+          {% endfor %}
+
+    # -------------------------------------------------------------------------
+    # FAN OUT — one host per SG (named after the SG, not the partition, so
+    # multiple SGs on the same partition still parallelize).
+    # -------------------------------------------------------------------------
+    - name: Add each SG as its own pseudo-host
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: sgs_to_provision_grp
+        ansible_connection: local
+        ansible_python_interpreter: "{{ zhmc_python_interpreter }}"
+        sg_spec: "{{ item }}"
+        cpc_name: "{{ cpc_name }}"
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        fail_fast: "{{ fail_fast | default(true) }}"
+      loop: "{{ sgs_to_provision }}"
+      loop_control:
+        label: "{{ item.name }} → {{ item.partition }}"
+      changed_when: false
+
+# -----------------------------------------------------------------------------
+# PLAY 2 — provision SGs in parallel
+# -----------------------------------------------------------------------------
+- name: "Provision storage groups in parallel"
+  hosts: sgs_to_provision_grp
+  gather_facts: false
+  strategy: free
+  any_errors_fatal: false
+  tasks:
+
+    - name: "Provision SG {{ inventory_hostname }}"
+      ansible.builtin.include_tasks: tasks/provision-one-storage-group.yml
+      vars:
+        sg: "{{ sg_spec }}"
+
+# -----------------------------------------------------------------------------
+# PLAY 3 — consolidate, report, exit code
+# -----------------------------------------------------------------------------
+- name: "Consolidate SG results and write reports"
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/connection.yml
+    - vars/storage_groups.yml
+
+  tasks:
+
+    - name: Pull each SG's outcome out of hostvars
+      ansible.builtin.set_fact:
+        sg_results: >-
+          {{ groups['sgs_to_provision_grp']
+             | default([])
+             | map('extract', hostvars, 'this_result')
+             | select('defined')
+             | list }}
+
+    - name: Identify SGs that died before producing a this_result
+      ansible.builtin.set_fact:
+        _sgs_without_result: >-
+          {{ (groups['sgs_to_provision_grp'] | default([]))
+             | difference(sg_results | map(attribute='name') | list) }}
+
+    - name: Synthesize FAILED entries for SGs with no this_result
+      ansible.builtin.set_fact:
+        sg_results: >-
+          {{ sg_results + [{
+                'name':   item,
+                'status': 'FAILED',
+                'error':  'no this_result was set — host likely died inside an unhandled task; see play log'
+             }] }}
+      loop: "{{ _sgs_without_result }}"
+      when: _sgs_without_result | length > 0
+
+    - name: Console summary
+      ansible.builtin.debug:
+        msg: |
+          ================================================================
+          STORAGE-GROUP PROVISIONING SUMMARY  ({{ sg_results | length }} SG(s))
+          CPC: {{ cpc_name }}    HMC: {{ hmc_host }}
+          ================================================================
+          {% for r in sg_results %}
+          {{ r.status }}  —  {{ r.name }}{% if r.status == 'OK' %}
+              Partition      : {{ r.partition }}
+              Description    : {{ r.sg_description }}
+              Paths          : {{ r.connectivity }}
+              Boot volume    : {{ r.boot_volume | default('(none)') }}{% if r.boot_size_gb | default(0) | int > 0 %} ({{ r.boot_size_gb }} GB){% endif %}
+              Data volumes   : {% if r.data_volumes | length > 0 %}{% for v in r.data_volumes %}{{ v }} ({{ r.data_sizes_gb[loop.index0] }} GB){% if not loop.last %}, {% endif %}{% endfor %}{% else %}(none){% endif %}
+
+              WWPNs          : {{ r.wwpns | join(', ') }}
+              Duration       : {{ r.duration_s | default('n/a') }} s{% else %}
+              Partition      : {{ r.partition | default('?') }}
+              ERROR          : {{ r.error | default('see play output') }}{% endif %}
+          {% endfor %}
+          ================================================================
+
+    - name: Write storage-groups report (text — for the SAN ticket)
+      ansible.builtin.copy:
+        dest: "./storage-groups-report.txt"
+        mode: "0644"
+        content: |
+          # ============================================================
+          # LinuxONE storage-groups provisioning report (parallel run)
+          # CPC : {{ cpc_name }}
+          # HMC : {{ hmc_host }}
+          # Generated : {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+          # Total SGs : {{ sg_results | length }}
+          # Successes : {{ sg_results | selectattr('status','equalto','OK') | list | length }}
+          # Failures  : {{ sg_results | selectattr('status','equalto','FAILED') | list | length }}
+          # ============================================================
+
+          {% for r in sg_results %}
+          [{{ r.name }}]
+          status         = {{ r.status }}
+          {% if r.status == 'OK' %}
+          partition      = {{ r.partition }}
+          description    = {{ r.sg_description }}
+          connectivity   = {{ r.connectivity }}
+          shared         = {{ r.shared | default(false) }}
+          boot_volume    = {{ r.boot_volume | default('') }}
+          boot_size_gb   = {{ r.boot_size_gb | default(0) }}
+          data_volumes   = {{ r.data_volumes | join(', ') }}
+          data_sizes_gb  = {{ r.data_sizes_gb | join(', ') }}
+          duration_s     = {{ r.duration_s | default('n/a') }}
+          {% for w in r.wwpns %}
+          wwpn_{{ loop.index }}         = {{ w }}
+          {% endfor %}
+          {% else %}
+          partition      = {{ r.partition | default('?') }}
+          error          = {{ r.error | default('see playbook output') }}
+          {% endif %}
+
+          {% endfor %}
+          # ============================================================
+          # SAN ZONING — give this whole list to your storage admin:
+          # ============================================================
+          {% for r in sg_results | selectattr('status','equalto','OK') %}
+          # {{ r.name }}  (partition {{ r.partition }}):
+          {% for w in r.wwpns %}
+              {{ w }}
+          {% endfor %}
+          {% endfor %}
+
+    - name: Write storage-groups report (JSON — for tooling / CMDB)
+      ansible.builtin.copy:
+        dest: "./storage-groups-report.json"
+        mode: "0644"
+        content: "{{ {
+            'cpc':           cpc_name,
+            'hmc':           hmc_host,
+            'generated_utc': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+            'total':         sg_results | length,
+            'successes':     sg_results | selectattr('status','equalto','OK') | list | length,
+            'failures':      sg_results | selectattr('status','equalto','FAILED') | list | length,
+            'storage_groups': sg_results
+          } | to_nice_json }}\n"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: |
+          Wrote ./storage-groups-report.txt   (human / SAN-ticket format)
+                ./storage-groups-report.json  (machine readable)
+
+    - name: Hard-fail at end if ANY SG failed
+      ansible.builtin.fail:
+        msg: >
+          {{ sg_results | selectattr('status','equalto','FAILED') | list | length }}
+          SG(s) failed. See storage-groups-report.txt for details.
+      when:
+        - sg_results | selectattr('status','equalto','FAILED') | list | length > 0
