@@ -1,0 +1,230 @@
+---
+# =============================================================================
+# Per-SG provisioning (parallel-safe).
+#
+# Included from provision-storage-groups.yml inside PLAY 2 — each SG is its
+# own pseudo-host (named after the SG, not the partition, so two SGs on the
+# same partition still parallelize). Per-host facts → no cross-talk.
+#
+# Steps:
+#   1. Verify the target partition already exists.
+#   2. Create FCP storage group.
+#   3. Create boot volume IF defined for this SG.
+#   4. Create data volumes (optional list).
+#   5. Attach SG → partition.
+#   6. Update SG description (auto-generated if user didn't supply one).
+#   7. Read back WWPNs.
+#   8. Save this_result.
+#
+# Variables expected:
+#   sg                — the SG spec (one entry from vars/storage_groups.yml)
+#   cpc_name, hmc_host, hmc_auth — pushed onto the host by add_host
+#   fail_fast         — if true, the rescue re-raises so PLAY 2 stops this host
+# =============================================================================
+
+- name: "[{{ sg.name }}] Provision SG → {{ sg.partition }}"
+  block:
+
+    - name: "[{{ sg.name }}] Record start time"
+      ansible.builtin.set_fact:
+        _start_epoch: "{{ ansible_date_time.epoch | default(lookup('pipe', 'date +%s')) }}"
+
+    # -------------------------------------------------------------------------
+    # 1) Verify partition exists
+    # -------------------------------------------------------------------------
+    - name: "[{{ sg.name }}] Verify target partition '{{ sg.partition }}' exists"
+      ibm.ibm_zhmc.zhmc_partition:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ sg.partition }}"
+        state: facts
+      register: partition_facts
+      failed_when: partition_facts.partition is not defined
+
+    # -------------------------------------------------------------------------
+    # 2) Create FCP storage group
+    # -------------------------------------------------------------------------
+    - name: "[{{ sg.name }}] Create FCP storage group"
+      ibm.ibm_zhmc.zhmc_storage_group:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ sg.name }}"
+        state: present
+        properties:
+          description:    "{{ sg.description | default(sg.name) }}"
+          type:           "{{ sg.type   | default('fcp') }}"
+          shared:         "{{ sg.shared | default(false) }}"
+          connectivity:   "{{ sg.connectivity   | default(2) }}"
+          max-partitions: "{{ sg.max_partitions | default(1) }}"
+      register: sg_create_result
+
+    - name: "[{{ sg.name }}] Wait for HMC to commit the new SG"
+      ansible.builtin.command: sleep 10
+      changed_when: false
+      when: sg_create_result.changed | default(false) | bool
+
+    # -------------------------------------------------------------------------
+    # 3) Boot volume (only if this SG defines one — many data SGs won't)
+    # -------------------------------------------------------------------------
+    - name: "[{{ sg.name }}] Create boot volume"
+      ibm.ibm_zhmc.zhmc_storage_volume:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        storage_group_name: "{{ sg.name }}"
+        name: "{{ sg.boot_volume.name }}"
+        state: present
+        properties:
+          description: "{{ sg.boot_volume.description | default('Boot disk') }}"
+          size:        "{{ sg.boot_volume.size }}"
+          usage:       "boot"
+      register: boot_vol_result
+      retries: 6
+      delay: 5
+      until: boot_vol_result is succeeded
+      when: sg.boot_volume is defined and (sg.boot_volume | length) > 0
+
+    # -------------------------------------------------------------------------
+    # 4) Data volumes
+    # -------------------------------------------------------------------------
+    - name: "[{{ sg.name }}] Create data volumes"
+      ibm.ibm_zhmc.zhmc_storage_volume:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        storage_group_name: "{{ sg.name }}"
+        name: "{{ item.name }}"
+        state: present
+        properties:
+          description: "{{ item.description | default(item.name) }}"
+          size:        "{{ item.size }}"
+          usage:       "data"
+      loop: "{{ sg.data_volumes | default([]) }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.size }} GB)"
+      register: data_vol_result
+      retries: 6
+      delay: 5
+      until: data_vol_result is succeeded
+      when: (sg.data_volumes | default([]) | length) > 0
+
+    # -------------------------------------------------------------------------
+    # 5) Attach SG to partition
+    # -------------------------------------------------------------------------
+    - name: "[{{ sg.name }}] Attach storage group → partition '{{ sg.partition }}'"
+      ibm.ibm_zhmc.zhmc_storage_group_attachment:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        storage_group_name: "{{ sg.name }}"
+        partition_name: "{{ sg.partition }}"
+        state: attached
+      register: sg_attach_result
+      retries: 6
+      delay: 5
+      until: sg_attach_result is succeeded
+
+    - name: "[{{ sg.name }}] Wait for HMC to mint VSRs/WWPNs after attach"
+      ansible.builtin.command: sleep 30
+      changed_when: false
+      when: sg_attach_result.changed | default(false) | bool
+
+    # -------------------------------------------------------------------------
+    # 6) Update description (post-volume / post-attach)
+    # -------------------------------------------------------------------------
+    # Compute pieces in steps — clearer than a single nested ternary, and the
+    # YAML parser handles each as its own template instead of one fragile blob.
+    - name: "[{{ sg.name }}] Compute total GB for the description"
+      ansible.builtin.set_fact:
+        _sg_total_gb: >-
+          {{ ((sg.boot_volume.size | default(0)) | int)
+             + (sg.data_volumes | default([]) | map(attribute='size') | map('int') | sum) }}
+        _sg_boot_blurb: >-
+          {{ (' | boot=' ~ sg.boot_volume.name ~ ' (' ~ sg.boot_volume.size ~ ' GB)')
+             if (sg.boot_volume is defined and (sg.boot_volume | length) > 0)
+             else '' }}
+        _sg_data_count: "{{ sg.data_volumes | default([]) | length }}"
+
+    - name: "[{{ sg.name }}] Compute storage-group description"
+      ansible.builtin.set_fact:
+        sg_description: >-
+          {% if (sg.description | default('') | length) > 0 -%}
+          {{ sg.description }}
+          {%- else -%}
+          FCP SG '{{ sg.name }}' for partition {{ sg.partition }}{{ _sg_boot_blurb }} | data={{ _sg_data_count }} volume(s) ({{ _sg_total_gb }} GB total) | {{ sg.connectivity | default(2) }} paths | updated {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+          {%- endif %}
+
+    - name: "[{{ sg.name }}] Update storage-group description"
+      ibm.ibm_zhmc.zhmc_storage_group:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ sg.name }}"
+        state: present
+        properties:
+          description: "{{ sg_description }}"
+      register: sg_desc_update
+
+    # -------------------------------------------------------------------------
+    # 7) Read back WWPNs
+    # -------------------------------------------------------------------------
+    - name: "[{{ sg.name }}] Fetch storage group facts (with VSRs/WWPNs expanded)"
+      ibm.ibm_zhmc.zhmc_storage_group:
+        hmc_host: "{{ hmc_host }}"
+        hmc_auth: "{{ hmc_auth }}"
+        cpc_name: "{{ cpc_name }}"
+        name: "{{ sg.name }}"
+        state: facts
+        expand: true
+      register: sg_facts
+      retries: 10
+      delay: 15
+
+    - name: "[{{ sg.name }}] Extract WWPNs"
+      ansible.builtin.set_fact:
+        this_wwpns: >-
+          {{
+            sg_facts.storage_group['virtual-storage-resources']
+            | default([])
+            | selectattr('world-wide-port-name', 'defined')
+            | map(attribute='world-wide-port-name')
+            | list
+          }}
+
+    - name: "[{{ sg.name }}] Save per-host result (the report reads this)"
+      ansible.builtin.set_fact:
+        this_result:
+          name:           "{{ sg.name }}"
+          partition:      "{{ sg.partition }}"
+          storage_group:  "{{ sg.name }}"
+          sg_description: "{{ sg_description }}"
+          connectivity:   "{{ sg.connectivity | default(2) }}"
+          shared:         "{{ sg.shared | default(false) }}"
+          boot_volume:    "{{ (sg.boot_volume.name | default('')) }}"
+          boot_size_gb:   "{{ (sg.boot_volume.size | default(0)) }}"
+          data_volumes:   "{{ sg.data_volumes | default([]) | map(attribute='name') | list }}"
+          data_sizes_gb:  "{{ sg.data_volumes | default([]) | map(attribute='size') | list }}"
+          wwpns:          "{{ this_wwpns }}"
+          status:         "OK"
+          duration_s:     "{{ ((lookup('pipe','date +%s') | int) - (_start_epoch | int)) }}"
+
+  # ===========================================================================
+  # rescue
+  # ===========================================================================
+  rescue:
+
+    - name: "[{{ sg.name }}] FAILED — record outcome for the report"
+      ansible.builtin.set_fact:
+        this_result:
+          name:           "{{ sg.name }}"
+          partition:      "{{ sg.partition | default('?') }}"
+          storage_group:  "{{ sg.name }}"
+          status:         "FAILED"
+          error:          "{{ ansible_failed_result.msg | default(ansible_failed_task.name | default('see prior task output')) }}"
+
+    - name: "[{{ sg.name }}] Re-raise (fail_fast=true) so this SG is marked failed"
+      ansible.builtin.fail:
+        msg: "fail_fast=true and SG {{ sg.name }} failed: {{ this_result.error }}"
+      when: fail_fast | default(true) | bool
