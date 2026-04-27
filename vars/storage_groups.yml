@@ -1,0 +1,115 @@
+---
+# =============================================================================
+# Standalone storage-group specification.
+#
+# Each entry defines ONE FCP storage group that will be created, populated
+# with volumes, and attached to a named partition that ALREADY EXISTS.
+#
+# This is intentionally decoupled from vars/partitions.yml — a single
+# partition can have multiple SGs defined here, and you can add / remove /
+# attach SGs without ever touching the partition definitions.
+#
+# Used by provision-storage-groups.yml (and decommission-storage-groups.yml
+# if/when added).
+#
+# Field reference per entry:
+#   name              (required)   storage group name (unique per CPC)
+#   partition         (required)   name of the partition to attach to
+#   description       (optional)   if set, used verbatim; otherwise the
+#                                  playbook auto-generates a rich description
+#   type              (optional)   default 'fcp'
+#   shared            (optional)   default false (single-attachment SG)
+#   connectivity      (optional)   default 2 paths (multipath count)
+#   max_partitions    (optional)   default 1
+#   boot_volume       (optional)   define ONLY if this SG should contain the
+#                                  boot disk; usually omitted for data SGs
+#       name (req), size (GB, req), description (opt)
+#   data_volumes      (optional)   list; each entry: name (req), size (req),
+#                                  description (opt)
+# =============================================================================
+
+# Stop on first failure? Set to false to keep going on the remaining SGs if
+# one fails (useful for batch runs where a single bad reference shouldn't
+# block the rest).
+fail_fast: true
+
+storage_groups:
+
+  # ---------------------------------------------------------------------------
+  # Example 1 — extra DATA-only SG for l1testw1 (no boot volume, just data)
+  # ---------------------------------------------------------------------------
+  - name:        "l1testw1-data-extra-SG"
+    partition:   "l1testw1"
+    description: ""             # empty → auto-generated
+    type:        fcp
+    shared:      false
+    connectivity: 4
+    max_partitions: 1
+    data_volumes:
+      - { name: "vol-l1testw1-app01",   size: 200, description: "app data" }
+      - { name: "vol-l1testw1-app02",   size: 200, description: "app data 2" }
+
+  # ---------------------------------------------------------------------------
+  # Example 2 — DB SG for l1testw2 with boot + data volumes
+  # ---------------------------------------------------------------------------
+  - name:        "l1testw2-db-SG"
+    partition:   "l1testw2"
+    description: "Database storage for l1testw2 (PostgreSQL)"
+    type:        fcp
+    shared:      false
+    connectivity: 4
+    max_partitions: 1
+    boot_volume:
+      name:        "vol-l1testw2-db-boot"
+      size:        100
+      description: "DB instance boot"
+    data_volumes:
+      - { name: "vol-l1testw2-pgdata", size: 500, description: "/var/lib/pgsql/data" }
+      - { name: "vol-l1testw2-pgwal",  size: 100, description: "WAL" }
+
+  # ---------------------------------------------------------------------------
+  # Example 3 — bulk archive SG for l1testw3 (data-only, low path count)
+  # ---------------------------------------------------------------------------
+  - name:        "l1testw3-archive-SG"
+    partition:   "l1testw3"
+    description: ""             # auto-generated
+    connectivity: 2
+    data_volumes:
+      - { name: "vol-l1testw3-archive-01", size: 1000, description: "archive volume 1" }
+
+  # ---------------------------------------------------------------------------
+  # Example 4 — backup SG for l1testw4
+  # ---------------------------------------------------------------------------
+  - name:        "l1testw4-backup-SG"
+    partition:   "l1testw4"
+    description: "Backup target SG for l1testw4"
+    connectivity: 2
+    data_volumes:
+      - { name: "vol-l1testw4-bkp-01", size: 500, description: "weekly fulls" }
+      - { name: "vol-l1testw4-bkp-02", size: 500, description: "daily incrementals" }
+
+  # ---------------------------------------------------------------------------
+  # Example 5 — SECOND SG also attached to l1testw1.
+  #
+  # Demonstrates that a single LPAR can have multiple SGs in one run. They
+  # fan out independently (each SG = its own pseudo-host) so they're created
+  # in parallel just like SGs going to different LPARs.
+  # ---------------------------------------------------------------------------
+  - name:        "l1testw1-logs-SG"
+    partition:   "l1testw1"           # same partition as Example 1
+    description: ""                   # auto-generated
+    connectivity: 2
+    data_volumes:
+      - { name: "vol-l1testw1-logs-01", size: 100, description: "/var/log overflow" }
+
+  # ---------------------------------------------------------------------------
+  # Example 6 — SHARED batch SG attached to l1testw3 (in addition to its
+  # archive SG from Example 3).
+  # ---------------------------------------------------------------------------
+  - name:        "l1testw3-batch-SG"
+    partition:   "l1testw3"           # also has l1testw3-archive-SG (Example 3)
+    description: "Batch processing scratch space"
+    connectivity: 4
+    data_volumes:
+      - { name: "vol-l1testw3-batch-01", size: 250, description: "batch input" }
+      - { name: "vol-l1testw3-batch-02", size: 250, description: "batch output" }
