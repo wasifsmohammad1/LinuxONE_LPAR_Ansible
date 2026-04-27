@@ -1,0 +1,53 @@
+---
+# =============================================================================
+# Expand a single SG spec from the compact input form into the explicit form.
+#
+# Included from generate-storage-groups-vars.yml. For each volume_set on `sg`,
+# delegates to _expand-one-volume-set.yml which appends individual volume
+# dicts to `_vols_from_sets`. Then we merge any explicit `data_volumes`
+# already on the SG, drop `volume_sets`, and append the cleaned SG dict to
+# `expanded_sgs`.
+#
+# Inputs:
+#   sg              — one entry from input_data.storage_groups
+#   expanded_sgs    — accumulator (list of expanded SG dicts), updated in place
+# =============================================================================
+
+- name: "[{{ sg.name }}] Reset per-SG volume accumulator"
+  ansible.builtin.set_fact:
+    _vols_from_sets: []
+
+- name: "[{{ sg.name }}] Expand each volume_set"
+  ansible.builtin.include_tasks: tasks/_expand-one-volume-set.yml
+  vars:
+    vset: "{{ this_vset }}"
+  loop: "{{ sg.volume_sets | default([]) }}"
+  loop_control:
+    loop_var: this_vset
+    label: "{{ this_vset.prefix }} × {{ this_vset.count }} ({{ this_vset.size }} GB)"
+  when: (sg.volume_sets | default([]) | length) > 0
+
+- name: "[{{ sg.name }}] Build expanded SG dict"
+  ansible.builtin.set_fact:
+    _expanded_sg: >-
+      {{
+        (sg | dict2items
+            | rejectattr('key', 'in', ['volume_sets'])
+            | items2dict)
+        | combine({
+            'data_volumes': (_vols_from_sets + (sg.data_volumes | default([])))
+          })
+      }}
+
+- name: "[{{ sg.name }}] Per-SG sanity — at least one volume defined"
+  ansible.builtin.assert:
+    that:
+      - (_expanded_sg.data_volumes | length) > 0
+        or (_expanded_sg.boot_volume is defined and (_expanded_sg.boot_volume.name | default('') | length) > 0)
+    fail_msg: >
+      SG '{{ sg.name }}' produced zero volumes after expansion. Either add a
+      `volume_sets` entry, an explicit `data_volumes` list, or a `boot_volume`.
+
+- name: "[{{ sg.name }}] Append to expanded_sgs ({{ _expanded_sg.data_volumes | length }} volumes)"
+  ansible.builtin.set_fact:
+    expanded_sgs: "{{ expanded_sgs + [_expanded_sg] }}"
